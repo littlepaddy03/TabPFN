@@ -318,14 +318,32 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
         
         static_seed, rng = infer_random_state(self.random_state)
         
+        # Create preprocessor kwargs with required parameters if not provided
+        preprocessor_kwargs = dict(self.preprocessor_kwargs)
+        if 'temporal_features' not in preprocessor_kwargs:
+            preprocessor_kwargs['temporal_features'] = [f"temp_{i}" for i in range(X.shape[2])]
+        if 'static_features' not in preprocessor_kwargs:
+            preprocessor_kwargs['static_features'] = [f"static_{i}" for i in range(X.shape[2])]
+        
         # Prepare agricultural data: preprocess and create encoder
         self.agri_preprocessor_, self.agri_encoder_, X_processed, y_processed = (
             prepare_agri_data_for_tabpfn(
                 X, 
                 y,
-                preprocessor=AgriDataPreprocessor(**self.preprocessor_kwargs),
+                preprocessor=AgriDataPreprocessor(**preprocessor_kwargs),
             )
         )
+        
+        # Handle NaN values in the processed target
+        if np.isnan(y_processed).any():
+            # Remove samples with NaN targets
+            valid_mask = ~np.isnan(y_processed)
+            X_processed = X_processed[valid_mask]
+            y_processed = y_processed[valid_mask]
+            
+            # If no valid samples remain, raise an error
+            if len(y_processed) == 0:
+                raise ValueError("All target values are NaN after preprocessing")
         
         # Configure agricultural encoder with appropriate dimensions
         temporal_input_dim = X.shape[2]  # Number of features per time step
@@ -350,12 +368,16 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
             device=self.device_,
         ).cpu().numpy()
         
-        # Standardize target values
-        mean = np.mean(y_processed)
-        std = np.std(y_processed)
+        # Standardize target values using nan-aware functions
+        mean = np.nanmean(y_processed)
+        std = np.nanstd(y_processed)
         self.y_train_mean_ = mean.item()
-        self.y_train_std_ = std.item() + 1e-20
+        self.y_train_std_ = std.item() + 1e-20  # Add small constant to avoid division by zero
         y_standardized = (y_processed - self.y_train_mean_) / self.y_train_std_
+        
+        # Double-check for NaN values before passing to TabPFN
+        if np.isnan(y_standardized).any():
+            raise ValueError("NaN values in standardized targets after preprocessing")
         
         # Fit the underlying TabPFN regressor with the encoded data
         self.tabpfn_regressor_.fit(X_encoded, y_standardized)
@@ -366,7 +388,7 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
         self.executor_ = self.tabpfn_regressor_.executor_
         
         return self
-    
+
     @overload
     def predict(
         self,

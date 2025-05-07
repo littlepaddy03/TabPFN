@@ -48,7 +48,8 @@ class TimeFeaturesEncoder(nn.Module):
         padding: int = 1,
         use_attention: bool = True,
         dropout: float = 0.1,
-    ) -> None:
+        num_heads: int = 4,  # Add num_heads parameter with default=4
+    ):
         """Initialize the time features encoder.
         
         Args:
@@ -59,6 +60,7 @@ class TimeFeaturesEncoder(nn.Module):
             padding: Padding for convolutional layers
             use_attention: Whether to use self-attention for capturing temporal relationships
             dropout: Dropout rate for regularization
+            num_heads: Number of attention heads (must divide hidden_dim evenly)
         """
         super().__init__()
         
@@ -67,17 +69,24 @@ class TimeFeaturesEncoder(nn.Module):
         self.output_dim = output_dim
         self.use_attention = use_attention
         
+        # Ensure hidden_dim is divisible by num_heads
+        if use_attention and hidden_dim % num_heads != 0:
+            adjusted_hidden_dim = (hidden_dim // num_heads) * num_heads
+            print(f"Warning: hidden_dim ({hidden_dim}) is not divisible by num_heads ({num_heads}). "
+                f"Adjusting to {adjusted_hidden_dim}.")
+            self.hidden_dim = adjusted_hidden_dim
+        
         # Temporal feature extraction with 1D convolutions
         self.conv1 = nn.Conv1d(
             in_channels=input_dim,
-            out_channels=hidden_dim,
+            out_channels=self.hidden_dim,
             kernel_size=kernel_size,
             padding=padding,
         )
         
         self.conv2 = nn.Conv1d(
-            in_channels=hidden_dim,
-            out_channels=hidden_dim,
+            in_channels=self.hidden_dim,
+            out_channels=self.hidden_dim,
             kernel_size=kernel_size,
             padding=padding,
         )
@@ -85,17 +94,17 @@ class TimeFeaturesEncoder(nn.Module):
         # Optional self-attention layer for capturing long-range dependencies
         if use_attention:
             self.attention = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=4,
+                embed_dim=self.hidden_dim,
+                num_heads=num_heads,
                 dropout=dropout,
                 batch_first=True,
             )
         
         # Final projection layer
-        self.fc_out = nn.Linear(hidden_dim, output_dim)
+        self.fc_out = nn.Linear(self.hidden_dim, output_dim)
         
         self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.layer_norm = nn.LayerNorm(self.hidden_dim)
     
     def forward(
         self,
@@ -288,6 +297,7 @@ class AgriDataEncoder(InputEncoder):
             input_dim=temporal_input_dim,
             hidden_dim=temporal_hidden_dim,
             output_dim=fusion_input_dim,
+            num_heads=4,  # Explicitly specify num_heads
             **temporal_encoder_kwargs,
         )
         

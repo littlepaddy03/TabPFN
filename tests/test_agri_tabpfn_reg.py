@@ -3,6 +3,8 @@
 This script tests the functionality of the AgriTabPFNRegressor by creating synthetic
 agricultural data and verifying that the model can process and make predictions on it.
 """
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 import numpy as np
 from sklearn.metrics import mean_squared_error, r2_score
