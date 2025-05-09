@@ -294,6 +294,7 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
 
         # --- Preprocessing and Encoding ---
         # 1. Initialize and Fit AgriDataPreprocessor
+        logger.debug("Initializing and fitting AgriDataPreprocessor...")
         self.agri_preprocessor_ = AgriDataPreprocessor(
             static_row_index=self.static_row_index,
             max_temporal_length=self.max_temporal_length,
@@ -302,6 +303,7 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
         )
         # Fit preprocessor *before* potential y filtering
         self.agri_preprocessor_.fit(X)
+        logger.debug(f"Preprocessor fitted. Determined max temporal length: {self.agri_preprocessor_.max_temporal_length_}")
 
         # Handle NaNs in y: Remove corresponding samples from X and y
         nan_mask_y = np.isnan(y)
@@ -320,9 +322,12 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
 
 
         # 2. Transform X using the fitted preprocessor
+        logger.debug("Transforming training data X with AgriDataPreprocessor...")
         X_processed, temporal_mask = self.agri_preprocessor_.transform(X)
+        logger.debug(f"X_processed shape: {X_processed.shape}, temporal_mask shape: {temporal_mask.shape if temporal_mask is not None else 'None'}")
 
         # 3. Initialize AgriDataEncoder
+        logger.debug("Initializing AgriDataEncoder...")
         processed_rows, processed_cols = X_processed.shape[1], X_processed.shape[2]
         # Use fitted max temporal length from preprocessor
         n_temporal_steps = self.agri_preprocessor_.max_temporal_length_ or 0
@@ -340,8 +345,10 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
              static_encoder_kwargs=self.agri_encoder_kwargs.get('static_encoder_kwargs'),
         )
         self.agri_encoder_.to(self.device_)
+        logger.debug("AgriDataEncoder initialized and moved to device.")
 
         # 4. Encode X_processed -> X_encoded (2D)
+        logger.debug("Encoding preprocessed training data...")
         X_processed_tensor = torch.tensor(X_processed, dtype=torch.float32, device=self.device_)
         temporal_mask_tensor = torch.tensor(temporal_mask, dtype=torch.bool, device=self.device_) if temporal_mask is not None else None
 
@@ -353,15 +360,19 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
                 static_row_index=self.static_row_index # Pass index
             )
         X_encoded = X_encoded_tensor.cpu().numpy()
+        logger.info(f"Encoded training data shape (X_encoded): {X_encoded.shape}") # Log encoded shape
 
         # 5. Standardize y (use the potentially filtered y)
+        logger.debug("Standardizing target variable y...")
         self.y_train_mean_ = np.mean(y)
         self.y_train_std_ = np.std(y) + 1e-8 # Add epsilon
         y_standardized = (y - self.y_train_mean_) / self.y_train_std_
+        logger.debug(f"y standardized: mean={self.y_train_mean_:.4f}, std={self.y_train_std_:.4f}")
+
 
         # --- Fit Underlying TabPFN ---
         # 6. Fit the internal TabPFNRegressor instance
-        logger.info(f"Fitting underlying TabPFNRegressor with encoded data of shape {X_encoded.shape}")
+        logger.info(f"Fitting underlying TabPFNRegressor with encoded data of shape {X_encoded.shape}...")
         # The internal regressor will handle its own model loading, config setup etc.
         # It also sets its own fitted attributes.
         self.tabpfn_regressor_.fit(X_encoded, y_standardized)
@@ -432,9 +443,13 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
 
         # --- Preprocess and Encode Test Data ---
         # 1. Preprocess X_test
+        logger.debug("Transforming test data X with AgriDataPreprocessor...")
         X_processed, temporal_mask = self.agri_preprocessor_.transform(X)
+        logger.debug(f"Test X_processed shape: {X_processed.shape}, temporal_mask shape: {temporal_mask.shape if temporal_mask is not None else 'None'}")
+
 
         # 2. Encode X_processed -> X_encoded (2D)
+        logger.debug("Encoding preprocessed test data...")
         X_processed_tensor = torch.tensor(X_processed, dtype=torch.float32, device=self.device_)
         temporal_mask_tensor = torch.tensor(temporal_mask, dtype=torch.bool, device=self.device_) if temporal_mask is not None else None
 
@@ -447,10 +462,12 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
                  static_row_index=self.static_row_index
                  )
         X_encoded = X_encoded_tensor.cpu().numpy()
+        logger.debug(f"Encoded test data shape (X_encoded): {X_encoded.shape}")
 
         # --- Predict using Underlying TabPFN ---
         # 3. Predict using the fitted internal TabPFNRegressor
         # The internal regressor handles its own device placement, autocast, etc.
+        logger.debug(f"Predicting with underlying TabPFNRegressor (output_type='{output_type}')...")
         predictions_standardized = self.tabpfn_regressor_.predict(
             X_encoded,
             output_type=output_type, # type: ignore
@@ -459,6 +476,7 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
 
         # --- Rescale Predictions ---
         # 4. Rescale the standardized predictions back to the original scale
+        logger.debug("Rescaling predictions...")
         if output_type == "quantiles":
             if not isinstance(predictions_standardized, list):
                  raise TypeError(f"Expected list for quantile predictions, got {type(predictions_standardized)}")
@@ -467,12 +485,14 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
                 q_pred * self.y_train_std_ + self.y_train_mean_
                 for q_pred in predictions_standardized
             ]
+            logger.debug(f"Rescaled quantile predictions shapes: {[p.shape for p in rescaled_predictions]}")
             return rescaled_predictions
         else:
              if not isinstance(predictions_standardized, np.ndarray):
                  raise TypeError(f"Expected ndarray for {output_type} predictions, got {type(predictions_standardized)}")
              # Rescale the single numpy array
              rescaled_predictions = predictions_standardized * self.y_train_std_ + self.y_train_mean_
+             logger.debug(f"Rescaled {output_type} predictions shape: {rescaled_predictions.shape}")
              return rescaled_predictions
 
 
@@ -499,6 +519,7 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
              raise RuntimeError("Preprocessor or Encoder not initialized. Ensure model is fitted.")
 
         # --- Preprocess and Encode Input Data ---
+        logger.debug(f"Preprocessing and encoding data for get_embeddings (data_source='{data_source}')...")
         X_processed, temporal_mask = self.agri_preprocessor_.transform(X)
         X_processed_tensor = torch.tensor(X_processed, dtype=torch.float32, device=self.device_)
         temporal_mask_tensor = torch.tensor(temporal_mask, dtype=torch.bool, device=self.device_) if temporal_mask is not None else None
@@ -512,10 +533,15 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
                 static_row_index=self.static_row_index
             )
         X_encoded = X_encoded_tensor.cpu().numpy()
+        logger.debug(f"Encoded data shape for embeddings: {X_encoded.shape}")
+
 
         # --- Get Embeddings from Underlying TabPFN ---
         # Call the get_embeddings method of the fitted internal regressor
-        return self.tabpfn_regressor_.get_embeddings(X_encoded, data_source=data_source)
+        logger.debug(f"Getting embeddings from underlying TabPFNRegressor (data_source='{data_source}')...")
+        embeddings = self.tabpfn_regressor_.get_embeddings(X_encoded, data_source=data_source)
+        logger.debug(f"Retrieved embeddings shape: {embeddings.shape}")
+        return embeddings
 
     # Implement __sklearn_is_fitted__ for check_is_fitted compatibility
     def __sklearn_is_fitted__(self) -> bool:
@@ -538,14 +564,18 @@ class AgriTabPFNRegressor(RegressorMixin, BaseEstimator):
             # Also check the explicit flag set by AgriTabPFN.
             getattr(self, '_is_fitted', False)
         )
-        try:
-             if underlying_fitted and self.tabpfn_regressor_ is not None:
-                  check_is_fitted(self.tabpfn_regressor_)
-                  underlying_really_fitted = True
-             else:
-                  underlying_really_fitted = False
-        except Exception: # Catch NotFittedError from check_is_fitted
-             underlying_really_fitted = False
+        underlying_really_fitted = False # Assume not fitted unless check passes
+        if underlying_fitted and self.tabpfn_regressor_ is not None:
+            try:
+                 check_is_fitted(self.tabpfn_regressor_)
+                 underlying_really_fitted = True
+            except Exception: # Catch NotFittedError from check_is_fitted
+                 underlying_really_fitted = False
 
 
         return agri_components_fitted and underlying_really_fitted
+
+    # Optional: Add _more_tags if needed for specific sklearn checks,
+    # but usually inheriting from Mixins is enough.
+    # def _more_tags(self):
+    #     return {"requires_y": True}
