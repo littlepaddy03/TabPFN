@@ -1,0 +1,84 @@
+# File: TabPFN/configs/example_agritabpfn_config.yaml
+# ==============================================================================
+# Experiment Metadata
+# ==============================================================================
+experiment_metadata:
+  experiment_name: "AgriTabPFN_Corn_Yield_Demo_NPZ_V4"
+  experiment_id: "agri_demo_004" # Unique ID for this experiment run
+  description: >
+    Demonstration experiment for AgriTabPFNRegressor using preprocessed NPZ data.
+    Preprocessor and Encoder are instantiated directly in the script using kwargs from this config.
+  random_seed: 42
+
+# ==============================================================================
+# Data Paths
+# ==============================================================================
+data:
+  # IMPORTANT: Update these paths to your actual NPZ file locations
+  # Paths can be absolute or relative to this config file's directory.
+  train_npz_path: "../experiment_outputs/train_processed.npz" # Example relative path
+  test_npz_path: "../experiment_outputs/test_processed.npz"   # Example relative path
+
+# ==============================================================================
+# Model Configuration
+# ==============================================================================
+model:
+  model_name: "AgriTabPFNRegressor"
+  # Path to your AgriTabPFNRegressor class
+  model_class_path: "tabpfn.agri_tabpfn.AgriTabPFNRegressor" 
+
+  model_params:
+    # Kwargs for AgriDataPreprocessor (instantiated within run_experiment.py)
+    agri_preprocessor_kwargs:
+      static_row_index: -1
+      max_temporal_length: null 
+      standardize_features: True
+      handle_missing_values: "mean"
+
+    # Kwargs for AgriDataEncoder (instantiated within run_experiment.py)
+    agri_encoder_kwargs:
+      temporal_hidden_dim: 32
+      static_hidden_dims: [32]
+      fusion_strategy: "concat"
+      encoded_embedding_dim: 64
+      # Example for deeper config (optional, ensure AgriDataEncoder handles these)
+      # time_features_encoder_params:
+      #   cnn_out_channels: [8, 16]
+      # static_features_encoder_params:
+      #   mlp_activation: "gelu"
+
+    # Parameters for AgriTabPFNRegressor constructor itself 
+    # (excluding agri_preprocessor and agri_encoder instances, which are handled by the script)
+    device: "cpu" 
+    # random_state: 42 # This will be passed to AgriTabPFNRegressor.
+                      # If not set, experiment_metadata.random_seed will be used.
+
+    # These are passed as **kwargs to AgriTabPFNRegressor's __init__
+    # and are typically intended for the internal TabPFNRegressor.
+    tabpfn_regressor_kwargs: 
+      N_ensemble_configurations: 4 
+      # fit_mode: "fit_preprocessors" 
+      # batch_size_inference: 256 
+
+# ==============================================================================
+# Baseline Model Preprocessing (Not used for AgriTabPFNRegressor)
+# ==============================================================================
+baseline_preprocessing:
+  enabled: False 
+
+# ==============================================================================
+# Evaluation Configuration
+# ==============================================================================
+evaluation:
+  metrics: ["rmse", "mae", "r2"]
+  evaluate_on_train_set: False 
+
+# ==============================================================================
+# Output Configuration
+# ==============================================================================
+output:
+  base_results_dir: "experiment_outputs" 
+  experiment_subdir_template: "{experiment_id}_{model_name}_{timestamp}"
+  save_model: True
+  save_predictions: True
+  log_level: "INFO"
