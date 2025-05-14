@@ -1,5 +1,4 @@
-# File: TabPFN/scripts/run_experiment.py
-# Copyright 2025 Google LLC
+# Copyright 2024 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,300 +11,473 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# pylint: disable=line-too-long,broad-except
 """
-Main script to run a single agricultural yield prediction experiment based on a YAML configuration file.
+Main script to run a single experiment based on a YAML configuration file.
+
+This script handles:
+1. Loading experiment configuration from a YAML file.
+2. Setting up logging.
+3. Loading and splitting data (standard, agricultural, or pre-split NPZ).
+4. Instantiating the specified model.
+5. Training the model.
+6. Making predictions.
+7. Evaluating the model.
+8. Saving results and trained model.
 """
+
 import argparse
 import logging
-import shutil
-import sys
+import os
 import time
-from pathlib import Path
+import warnings
+from typing import Any, Dict, Tuple, Union
+
 import numpy as np
-from typing import Union, Dict, Any, List, Tuple
+import pandas as pd
+import yaml
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
+from sklearn.model_selection import train_test_split
 
-# Ensure src path is available for utility imports
-SCRIPT_DIR_RUN = Path(__file__).resolve().parent
-TABPFN_ROOT_RUN = SCRIPT_DIR_RUN.parent
-SRC_DIR_RUN = TABPFN_ROOT_RUN / "src"
+from tabpfn import TabPFNClassifier, TabPFNRegressor
+from tabpfn.agri_tabpfn import AgriTabPFNRegressor
+# AgriDataLoader import remains commented as it's not yet implemented/used.
+# from tabpfn.agri_utils.data_loader import AgriDataLoader
+from tabpfn.encoders.agri_encoders import AgriDataEncoder
+from tabpfn.encoders.agri_interface import AgriDataPreprocessor
 
-if SRC_DIR_RUN.exists() and str(SRC_DIR_RUN) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR_RUN))
-if TABPFN_ROOT_RUN.exists() and str(TABPFN_ROOT_RUN) not in sys.path: # If src is not directly there
-    sys.path.insert(0, str(TABPFN_ROOT_RUN))
-
-try:
-    from tabpfn.agri_utils.experiment_utils import (
-        load_processed_npz_data,
-        dynamic_import_and_instantiate_model,
-        preprocess_for_baseline,
-        calculate_evaluation_metrics,
-        save_model_checkpoint,
-        save_predictions_to_npz,
-        save_metrics_to_json,
-        load_config_yaml,
-        setup_logging,
-        create_experiment_output_dir,
-        METRICS_FILENAME,
-        PREDICTIONS_FILENAME,
-        MODEL_CHECKPOINT_DIRNAME,
-        CONFIG_USED_FILENAME,
-        RUN_LOG_FILENAME
-    )
-    # Directly import core Agri components assuming fixed paths
-    # based on the project structure.
-    # IMPORTANT: User must ensure these paths are correct for their project.
-    from tabpfn.agri_tabpfn import AgriDataPreprocessor
-    from tabpfn.encoders.agri_encoders import AgriDataEncoder
-    # AgriTabPFNRegressor will be imported dynamically via model_class_path from config
-except ImportError as e:
-    print(f"Critical Import Error in run_experiment.py: {e}. Check PYTHONPATH, __init__.py files, and file locations.", file=sys.stderr)
-    print(f"Current sys.path: {sys.path}", file=sys.stderr)
-    sys.exit(1)
-
+# Configure basic logging
+logging.basicConfig(
+    level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-def run_single_experiment(config_path: Union[str, Path]) -> Dict[str, Any]:
-    """
-    Runs a single experiment as defined by the configuration file.
-    """
-    experiment_output_dir = None 
-    try:
-        # 1. Load Configuration
-        config = load_config_yaml(config_path)
 
-        # 2. Setup Output Directory and Logging
-        output_conf = config.get("output", {})
-        base_results_dir = Path(output_conf.get("base_results_dir", "experiment_results"))
-        exp_subdir_template = output_conf.get("experiment_subdir_template", "{experiment_id}_{model_name}_{timestamp}")
-        
-        meta_conf = config.get("experiment_metadata", {})
-        exp_id = meta_conf.get("experiment_id", f"exp_{time.strftime('%Y%m%d%H%M%S')}")
-        exp_name = meta_conf.get("experiment_name", "unnamed_experiment")
-        model_conf = config.get("model", {})
-        model_name_for_dir = model_conf.get("model_name", "unknown_model")
+def load_config(config_path: str) -> Dict[str, Any]:
+    """Loads experiment configuration from a YAML file.
 
-        experiment_output_dir = create_experiment_output_dir(
-            base_results_dir, exp_subdir_template, exp_id, exp_name, model_name_for_dir
+    Args:
+        config_path: Path to the YAML configuration file.
+
+    Returns:
+        A dictionary containing the experiment configuration.
+    """
+    logger.info('Loading configuration from %s', config_path)
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    logger.info('Configuration loaded successfully.')
+    return config
+
+
+def load_and_split_data(
+    data_config: Dict[str, Any], random_state: int
+) -> Tuple[
+    Union[pd.DataFrame, np.ndarray],
+    Union[pd.DataFrame, np.ndarray],
+    Union[pd.Series, np.ndarray],
+    Union[pd.Series, np.ndarray],
+]:
+    """Loads and splits data based on the provided configuration.
+
+    Supports loading from pre-split NPZ files (keys 'features', 'targets'),
+    a single agricultural NPY file (keys 'X', 'y' in a dictionary),
+    a CSV file, or a predefined dataset name.
+
+    Args:
+        data_config: Dictionary containing data loading parameters.
+        random_state: Random state for reproducibility of train/test split
+                      (only used if data is not pre-split).
+
+    Returns:
+        A tuple (X_train, X_test, y_train, y_test).
+    """
+    train_npz_path = data_config.get('train_npz_path')
+    test_npz_path = data_config.get('test_npz_path')
+    is_agri_data = data_config.get('is_agri_data', False)
+    file_path = data_config.get('file_path') # Used for single agri .npy or CSV
+    dataset_name = data_config.get('name')
+    target_column = data_config.get('target_column', 'target')
+    test_size = data_config.get('test_size', 0.2)
+
+    if train_npz_path and test_npz_path:
+        logger.info(
+            'Loading pre-split data from NPZ files: Train=%s, Test=%s',
+            train_npz_path,
+            test_npz_path,
         )
-        
-        log_file_path = experiment_output_dir / RUN_LOG_FILENAME
-        log_level = output_conf.get("log_level", "INFO")
-        setup_logging(log_file_path, log_level)
+        if not os.path.exists(train_npz_path):
+            raise FileNotFoundError(f'Train NPZ file not found: {train_npz_path}')
+        if not os.path.exists(test_npz_path):
+            raise FileNotFoundError(f'Test NPZ file not found: {test_npz_path}')
 
-        logger.info(f"Starting experiment: {exp_name} (ID: {exp_id})")
-        logger.info(f"Configuration loaded from: {Path(config_path).resolve()}")
-        logger.info(f"Results will be saved to: {experiment_output_dir.resolve()}")
+        train_data = np.load(train_npz_path, allow_pickle=True)
+        test_data = np.load(test_npz_path, allow_pickle=True)
 
-        try:
-            shutil.copy(Path(config_path), experiment_output_dir / CONFIG_USED_FILENAME)
-            logger.info(f"Copied configuration to {experiment_output_dir / CONFIG_USED_FILENAME}")
-        except Exception as e:
-            logger.error(f"Could not copy config file to output directory: {e}")
+        expected_x_key = 'features'
+        expected_y_key = 'targets'
 
-        # 3. Set Random Seed
-        random_seed = meta_conf.get("random_seed", None)
-        if random_seed is not None:
-            np.random.seed(random_seed) # type: ignore[call-overload]
-            logger.info(f"Global random seed set to: {random_seed}")
+        if expected_x_key not in train_data or expected_y_key not in train_data:
+            raise KeyError(
+                f"Keys '{expected_x_key}' and '{expected_y_key}' not found in"
+                f' {train_npz_path}. Available keys: {list(train_data.keys())}'
+            )
+        if expected_x_key not in test_data or expected_y_key not in test_data:
+            raise KeyError(
+                f"Keys '{expected_x_key}' and '{expected_y_key}' not found in"
+                f' {test_npz_path}. Available keys: {list(test_data.keys())}'
+            )
 
-        # 4. Load Data
-        data_conf = config.get("data", {})
-        train_npz_path_str = data_conf.get("train_npz_path", "")
-        test_npz_path_str = data_conf.get("test_npz_path", "")
+        x_train, y_train = train_data[expected_x_key], train_data[expected_y_key]
+        x_test, y_test = test_data[expected_x_key], test_data[expected_y_key]
+        logger.info(
+            'Loaded X_train shape: %s, y_train shape: %s from NPZ',
+            x_train.shape,
+            y_train.shape,
+        )
+        logger.info(
+            'Loaded X_test shape: %s, y_test shape: %s from NPZ',
+            x_test.shape,
+            y_test.shape,
+        )
+        return x_train, x_test, y_train, y_test
 
-        config_dir = Path(config_path).parent
-        train_npz_path = Path(train_npz_path_str)
-        if not train_npz_path.is_absolute():
-            train_npz_path = (config_dir / train_npz_path).resolve()
-        
-        test_npz_path = Path(test_npz_path_str)
-        if not test_npz_path.is_absolute():
-            test_npz_path = (config_dir / test_npz_path).resolve()
+    elif is_agri_data:
+        logger.info(
+            'Loading agricultural data from single NPY file for splitting: %s',
+            file_path,
+        )
+        if not file_path:
+            raise ValueError(
+                "'file_path' must be specified for 'is_agri_data' if not using"
+                ' pre-split NPZ files.'
+            )
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(
+                f'Agricultural data file not found: {file_path}. '
+                'Ensure it is preprocessed (e.g., by'
+                ' preprocess_agri_datasets.py).'
+            )
+        data = np.load(file_path, allow_pickle=True).item()
+        if 'X' not in data or 'y' not in data:
+            raise KeyError(
+                f"Keys 'X' and 'y' not found in agri data file: {file_path}."
+                f' Available keys: {list(data.keys())}'
+            )
 
-        if not train_npz_path_str or not test_npz_path_str:
-            logger.error("Train or test NPZ data path not specified in configuration.")
-            raise ValueError("Missing train/test NPZ paths in config.")
-        if not train_npz_path.exists() or not test_npz_path.exists():
-            logger.error(f"Train ({train_npz_path}) or Test ({test_npz_path}) NPZ data file not found.")
-            raise FileNotFoundError("Train or Test NPZ data file not found after path resolution.")
+        x_all = data['X']
+        y_all = data['y']
+        logger.info(
+            'Loaded agricultural data X shape: %s, y shape: %s before splitting.',
+            x_all.shape,
+            y_all.shape,
+        )
+    elif file_path: # Assumed to be a CSV file
+        logger.info('Loading data from CSV for splitting: %s', file_path)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f'CSV data file not found: {file_path}')
+        data_df = pd.read_csv(file_path)
+        if target_column not in data_df.columns:
+            raise ValueError(
+                f"Target column '{target_column}' not found in {file_path}"
+            )
+        x_all = data_df.drop(columns=[target_column])
+        y_all = data_df[target_column]
+    elif dataset_name:
+        logger.info('Loading predefined dataset for splitting: %s', dataset_name)
+        if dataset_name == 'iris':
+            from sklearn.datasets import load_iris
+            iris = load_iris()
+            x_all = pd.DataFrame(iris.data, columns=iris.feature_names)
+            y_all = pd.Series(iris.target)
+        elif dataset_name == 'boston':
+            from sklearn.datasets import fetch_california_housing
+            housing = fetch_california_housing()
+            x_all = pd.DataFrame(housing.data, columns=housing.feature_names)
+            y_all = pd.Series(housing.target)
+        else:
+            raise ValueError(f'Unsupported predefined dataset_name: {dataset_name}')
+    else:
+        raise ValueError(
+            "Data config must provide valid keys: ('train_npz_path' and "
+            "'test_npz_path' with 'features'/'targets' keys), or ('is_agri_data:"
+            " True' and 'file_path' to an .npy dictionary with 'X'/'y' keys), "
+            "or ('file_path' to a CSV), or ('dataset_name')."
+        )
 
-        X_train_list, y_train, train_info = load_processed_npz_data(train_npz_path)
-        X_test_list, y_test, test_info = load_processed_npz_data(test_npz_path)
+    x_train, x_test, y_train, y_test = train_test_split(
+        x_all, y_all, test_size=test_size, random_state=random_state
+    )
+    logger.info(
+        'Data split into training and testing sets. X_train shape: %s, X_test'
+        ' shape: %s',
+        x_train.shape,
+        x_test.shape,
+    )
+    return x_train, x_test, y_train, y_test
 
-        if not X_train_list or y_train.size == 0:
-            logger.error("Training data is empty. Aborting.")
-            raise ValueError("Empty training data loaded.")
 
-        # 5. Instantiate Model
-        model_name = model_conf.get("model_name", "")
-        model_class_path = model_conf.get("model_class_path", "") # Path for the main model (e.g., AgriTabPFNRegressor)
-        model_params_from_config = model_conf.get("model_params", {})
+def run_single_experiment(config_path: str) -> Dict[str, Any]:
+    """Runs a single experiment based on the configuration file.
 
-        if not model_name or not model_class_path:
-            logger.error("Model name or class path not specified.")
-            raise ValueError("Missing model_name or model_class_path in config.")
+    Args:
+        config_path: Path to the YAML configuration file.
 
-        instantiation_kwargs: Dict[str, Any] = {}
+    Returns:
+        A dictionary containing the experiment results.
+    """
+    config = load_config(config_path)
+    exp_name = config.get('experiment_metadata', {}).get(
+        'experiment_name', config.get('experiment_name', 'default_experiment')
+    )
+    output_base_dir = config.get('output', {}).get('base_results_dir', 'results')
+    exp_subdir_template = config.get('output', {}).get(
+        'experiment_subdir_template', '{experiment_name}'
+    )
+    exp_id = config.get('experiment_metadata', {}).get('experiment_id', exp_name)
+    try:
+        exp_subdir = exp_subdir_template.format(experiment_name=exp_name, experiment_id=exp_id)
+    except KeyError:
+        logger.warning(
+            "Could not format experiment_subdir_template with available metadata."
+            " Using experiment_name directly as subdir."
+            )
+        exp_subdir = exp_name
 
-        if model_name == "AgriTabPFNRegressor":
-            preprocessor_kwargs = model_params_from_config.get("agri_preprocessor_kwargs", {})
-            encoder_kwargs = model_params_from_config.get("agri_encoder_kwargs", {})
-            
-            logger.info(f"Instantiating AgriDataPreprocessor with params: {preprocessor_kwargs}")
-            # Directly use imported class
-            agri_preprocessor_instance = AgriDataPreprocessor(**preprocessor_kwargs)
-            
-            logger.info(f"Instantiating AgriDataEncoder with params: {encoder_kwargs}")
-            # Directly use imported class
-            agri_encoder_instance = AgriDataEncoder(**encoder_kwargs)
+    output_dir = os.path.join(output_base_dir, exp_subdir)
+    os.makedirs(output_dir, exist_ok=True)
 
-            instantiation_kwargs["agri_preprocessor"] = agri_preprocessor_instance
-            instantiation_kwargs["agri_encoder"] = agri_encoder_instance
+    log_file_path = os.path.join(output_dir, f'{exp_name}.log')
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.FileHandler) and handler.baseFilename == log_file_path:
+            logging.getLogger().removeHandler(handler)
+            handler.close()
 
-            tabpfn_reg_kwargs = model_params_from_config.get("tabpfn_regressor_kwargs", {})
-            instantiation_kwargs.update(tabpfn_reg_kwargs)
+    file_handler = logging.FileHandler(log_file_path)
+    file_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    )
+    logging.getLogger().addHandler(file_handler)
 
-            if 'random_state' in model_params_from_config:
-                instantiation_kwargs['random_state'] = model_params_from_config['random_state']
-            elif random_seed is not None and 'random_state' not in instantiation_kwargs:
-                instantiation_kwargs['random_state'] = random_seed
-            
-            if 'device' in model_params_from_config:
-                 instantiation_kwargs['device'] = model_params_from_config['device']
-            elif 'device' not in instantiation_kwargs:
-                 instantiation_kwargs['device'] = 'cpu'
-        else: 
-            instantiation_kwargs.update(model_params_from_config)
-            if "random_state" not in instantiation_kwargs and random_seed is not None:
-                instantiation_kwargs["random_state"] = random_seed
-        
-        logger.info(f"Instantiating main model: {model_name} from {model_class_path} with final kwargs: {instantiation_kwargs}")
-        model = dynamic_import_and_instantiate_model(model_class_path, **instantiation_kwargs)
+    logger.info('Starting experiment: %s (ID: %s)', exp_name, exp_id)
+    logger.info('Output directory: %s', output_dir)
 
-        # 6. Data Preprocessing for Baseline Models
-        X_train_processed: Union[List[np.ndarray], np.ndarray] = X_train_list
-        X_test_processed: Union[List[np.ndarray], np.ndarray] = X_test_list
+    random_state = config.get('experiment_metadata', {}).get('random_seed', 42)
+    np.random.seed(random_state)
 
-        if model_name != "AgriTabPFNRegressor": 
-            baseline_prep_conf = config.get("baseline_preprocessing", {})
-            if baseline_prep_conf.get("enabled", False):
-                logger.info("Applying baseline preprocessing (3D list to 2D array).")
-                static_idx = baseline_prep_conf.get("static_row_index", -1)
-                agg_methods = baseline_prep_conf.get("temporal_aggregation", {}).get("methods", ["mean", "std"])
-                
-                X_train_processed = preprocess_for_baseline(X_train_list, static_idx, agg_methods)
-                X_test_processed = preprocess_for_baseline(X_test_list, static_idx, agg_methods)
-                logger.info(f"Shape of X_train after baseline preprocessing: {X_train_processed.shape}")
-            else:
-                logger.warning(
-                    f"Model {model_name} is not AgriTabPFNRegressor, but baseline_preprocessing is not enabled. "
-                    "Model will receive List[np.ndarray]. Ensure it can handle this format."
-                )
-        
-        # 7. Train Model
-        logger.info(f"Starting training for model: {model_name}")
-        train_start_time = time.time()
-        model.fit(X_train_processed, y_train)
-        train_duration_seconds = time.time() - train_start_time
-        logger.info(f"Training completed in {train_duration_seconds:.2f} seconds.")
+    if 'data' not in config:
+        raise ValueError("Missing 'data' section in configuration.")
+    x_train, x_test, y_train, y_test = load_and_split_data(
+        config['data'], random_state
+    )
 
-        # 8. Make Predictions
-        logger.info("Starting predictions on the test set.")
-        predict_start_time = time.time()
-        y_pred_test = model.predict(X_test_processed)
-        predict_duration_seconds = time.time() - predict_start_time
-        logger.info(f"Predictions completed in {predict_duration_seconds:.2f} seconds.")
+    if 'model' not in config:
+        raise ValueError("Missing 'model' section in configuration.")
+    model_config = config['model'] # This is config['model'] dictionary
+    model_name = model_config.get('name')
+    if not model_name:
+        model_class_path = model_config.get('model_class_path', '')
+        if model_class_path:
+            model_name = model_class_path.split('.')[-1]
+        else:
+            raise ValueError("Missing 'name' or 'model_class_path' in model configuration.")
 
-        y_pred_train = None
-        if config.get("evaluation", {}).get("evaluate_on_train_set", False):
-            logger.info("Starting predictions on the train set.")
-            try:
-                y_pred_train = model.predict(X_train_processed)
-            except Exception as e:
-                logger.warning(f"Could not make predictions on train set: {e}")
-
-        # 9. Evaluate Model
-        eval_conf = config.get("evaluation", {})
-        metric_names = eval_conf.get("metrics", ["rmse", "mae", "r2"])
-        logger.info(f"Calculating evaluation metrics for test set: {metric_names}")
-        
-        test_metrics = calculate_evaluation_metrics(y_test, y_pred_test, metric_names)
-        logger.info(f"Test Set Metrics: {test_metrics}")
-
-        train_metrics = {}
-        if y_pred_train is not None:
-            logger.info(f"Calculating evaluation metrics for train set: {metric_names}")
-            train_metrics = calculate_evaluation_metrics(y_train, y_pred_train, metric_names)
-            logger.info(f"Train Set Metrics: {train_metrics}")
-
-        # 10. Save Results
-        timestamp_end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        metrics_summary = {
-            "experiment_id": exp_id,
-            "experiment_name": exp_name,
-            "model_name": model_name,
-            "model_class_path": model_class_path,
-            "model_params_from_config": model_params_from_config, 
-            "model_instantiation_kwargs": instantiation_kwargs, 
-            "timestamp_start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(train_start_time - train_duration_seconds)),
-            "timestamp_end_utc": timestamp_end,
-            "training_duration_seconds": round(train_duration_seconds, 2),
-            "inference_duration_seconds": round(predict_duration_seconds, 2),
-            "evaluation_metrics_test": test_metrics,
-            "data_info": {
-                "train_npz_path": str(train_npz_path.resolve()),
-                "test_npz_path": str(test_npz_path.resolve()),
-                "num_train_samples": len(X_train_list),
-                "num_test_samples": len(X_test_list),
-                "random_seed_used": random_seed,
-            }
-        }
-        if train_metrics:
-            metrics_summary["evaluation_metrics_train"] = train_metrics
-
-        save_metrics_to_json(metrics_summary, experiment_output_dir)
-
-        if output_conf.get("save_predictions", True):
-            save_predictions_to_npz(experiment_output_dir, y_test, y_pred_test, test_info)
-
-        if output_conf.get("save_model", True):
-            model_checkpoint_path = experiment_output_dir / MODEL_CHECKPOINT_DIRNAME
-            save_model_checkpoint(model, model_name, model_checkpoint_path)
-
-        logger.info(f"Experiment {exp_id} finished successfully.")
-        return test_metrics
+    # general_model_args will hold parameters intended for the **kwargs of the model constructor
+    # after specific component configurations have been extracted.
+    general_model_args = model_config.get('params', model_config.get('model_params', {})).copy()
     
-    except Exception as e:
-        if logger.handlers: # Check if logger was successfully configured
-            logger.critical(f"Experiment run failed critically during execution: {e}", exc_info=True)
-        else: # Fallback to print if logger setup failed
-            print(f"CRITICAL ERROR in run_single_experiment (logging may not be set up): {e}", file=sys.stderr)
-        raise 
-    finally:
-        logging.shutdown()
+    # Ensure 'device' is handled. It's a common top-level param for AgriTabPFNRegressor.
+    # If not in general_model_args (from 'params'), check if it's at the top of model_config.
+    if 'device' not in general_model_args:
+        general_model_args['device'] = model_config.get('device', 'cpu')
+
+
+    logger.info(
+        'Instantiating model: %s. Initial general_model_args from config: %s', model_name, general_model_args
+    )
+
+    if model_name == 'TabPFNClassifier':
+        model = TabPFNClassifier(**general_model_args)
+    elif model_name == 'TabPFNRegressor':
+        model = TabPFNRegressor(**general_model_args)
+    elif model_name == 'AgriTabPFNRegressor':
+        # AgriTabPFNRegressor expects arguments like 'agri_preprocessor_kwargs'.
+        # These dictionaries are sourced from the YAML (where they are also named with '_kwargs').
+        
+        # 1. Extract the preprocessor configuration dictionary
+        # It could be directly under model_config (e.g., config.model.agri_preprocessor_kwargs)
+        # OR nested under general_model_args (e.g., config.model.params.agri_preprocessor_kwargs)
+        # We prioritize the one directly under model_config if both exist.
+        # Then, we ensure it's removed from general_model_args to avoid passing it twice.
+        
+        # Keys for YAML configuration
+        yaml_pp_key = 'agri_preprocessor_kwargs'
+        yaml_enc_key = 'agri_encoder_kwargs'
+        yaml_tab_key = 'tabpfn_regressor_kwargs'
+
+        # Argument names for AgriTabPFNRegressor constructor
+        constructor_pp_arg_name = 'agri_preprocessor_kwargs'
+        constructor_enc_arg_name = 'agri_encoder_kwargs'
+        constructor_tab_arg_name = 'tabpfn_regressor_kwargs'
+
+        # Get preprocessor_kwargs_dict
+        if yaml_pp_key in model_config:
+            preprocessor_kwargs_dict = model_config[yaml_pp_key]
+            general_model_args.pop(yaml_pp_key, None) # Remove if it was also in params
+        else:
+            preprocessor_kwargs_dict = general_model_args.pop(yaml_pp_key, {})
+
+        # Get encoder_kwargs_dict
+        if yaml_enc_key in model_config:
+            encoder_kwargs_dict = model_config[yaml_enc_key]
+            general_model_args.pop(yaml_enc_key, None)
+        else:
+            encoder_kwargs_dict = general_model_args.pop(yaml_enc_key, {})
+        
+        # Get tabpfn_regressor_kwargs_dict
+        if yaml_tab_key in model_config:
+            tabpfn_regressor_kwargs_dict = model_config[yaml_tab_key]
+            general_model_args.pop(yaml_tab_key, None)
+        else:
+            tabpfn_regressor_kwargs_dict = general_model_args.pop(yaml_tab_key, {})
+
+
+        logger.info('Resolved %s for constructor: %s', constructor_pp_arg_name, preprocessor_kwargs_dict)
+        logger.info('Resolved %s for constructor: %s', constructor_enc_arg_name, encoder_kwargs_dict)
+        logger.info('Resolved %s for constructor: %s', constructor_tab_arg_name, tabpfn_regressor_kwargs_dict)
+        logger.info('Remaining general_model_args to be spread for AgriTabPFNRegressor: %s', general_model_args)
+
+        # Pass to AgriTabPFNRegressor using *_kwargs argument names
+        model = AgriTabPFNRegressor(
+            **{constructor_pp_arg_name: preprocessor_kwargs_dict},
+            **{constructor_enc_arg_name: encoder_kwargs_dict},
+            **{constructor_tab_arg_name: tabpfn_regressor_kwargs_dict},
+            **general_model_args # Pass other general args like device, N_ensemble_configurations, etc.
+        )
+    elif model_config.get('model_class_path'): # For test mock models
+        module_path, class_name = model_config['model_class_path'].rsplit('.',1)
+        try:
+            module = __import__(module_path, fromlist=[class_name])
+            model_class = getattr(module, class_name)
+            model = model_class(**general_model_args) # Pass all general_model_args to mock model
+            logger.info("Instantiated mock model %s from path %s", class_name, module_path)
+        except Exception as e:
+            logger.error("Failed to instantiate mock model from path %s: %s", model_config['model_class_path'], e, exc_info=True)
+            raise
+    else:
+        raise ValueError(f'Unsupported model_name or configuration: {model_name}')
+
+    logger.info('Starting model training.')
+    start_time = time.time()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='No features_standardize set, standardizing features by default',
+            category=UserWarning
+        )
+        warnings.filterwarnings(
+            'ignore',
+            message=(
+                'Using style_string autoencoder for 2 features. This can lead to'
+                ' issues.'
+            ),
+            category=UserWarning,
+        )
+        model.fit(x_train, y_train)
+    training_time = time.time() - start_time
+    logger.info('Model training completed in %.2f seconds.', training_time)
+
+    logger.info('Starting model prediction.')
+    start_time = time.time()
+    y_pred = model.predict(x_test)
+    prediction_time = time.time() - start_time
+    logger.info('Model prediction completed in %.2f seconds.', prediction_time)
+
+    task_type = config.get('task_type', 'regression')
+    if isinstance(model, TabPFNClassifier):
+        task_type = 'classification'
+    elif isinstance(model, (TabPFNRegressor, AgriTabPFNRegressor)):
+        task_type = 'regression'
+
+    logger.info('Evaluating task_type: %s', task_type)
+    metrics = {'training_time': training_time, 'prediction_time': prediction_time}
+    eval_metrics_config = config.get('evaluation', {}).get('metrics', [])
+
+    if task_type == 'classification':
+        if not eval_metrics_config: eval_metrics_config = ['accuracy', 'f1_macro']
+        if 'accuracy' in eval_metrics_config:
+            metrics['accuracy'] = accuracy_score(y_test, y_pred)
+        if 'f1_macro' in eval_metrics_config:
+            metrics['f1_macro'] = f1_score(y_test, y_pred, average='macro')
+        if 'f1_micro' in eval_metrics_config:
+            metrics['f1_micro'] = f1_score(y_test, y_pred, average='micro')
+        if 'f1_weighted' in eval_metrics_config and len(np.unique(y_train)) > 2:
+             metrics['f1_weighted'] = f1_score(y_test, y_pred, average='weighted')
+    elif task_type == 'regression':
+        if not eval_metrics_config: eval_metrics_config = ['mse', 'mae', 'r2']
+        if 'mse' in eval_metrics_config or 'rmse' in eval_metrics_config:
+            mse_val = mean_squared_error(y_test, y_pred)
+            if 'mse' in eval_metrics_config: metrics['mse'] = mse_val
+            if 'rmse' in eval_metrics_config: metrics['rmse'] = np.sqrt(mse_val)
+        if 'mae' in eval_metrics_config:
+            metrics['mae'] = mean_absolute_error(y_test, y_pred)
+        if 'r2' in eval_metrics_config:
+            metrics['r2'] = r2_score(y_test, y_pred)
+    else:
+        logger.warning('Unsupported task_type for evaluation: %s. No metrics calculated.', task_type)
+
+    logger.info('Evaluation metrics: %s', metrics)
+
+    logger.info('Attempting to save results to results.yaml...')
+    results_path = os.path.join(output_dir, 'results.yaml')
+    try:
+        with open(results_path, 'w', encoding='utf-8') as f:
+            yaml.dump(metrics, f)
+        logger.info('Results saved successfully to %s', results_path)
+    except Exception as e: # pylint: disable=broad-except
+        logger.error("Failed to save results.yaml: %s", e, exc_info=True)
+
+    if config.get('output', {}).get('save_model', False):
+        model_path = os.path.join(output_dir, 'model.joblib')
+        try:
+            import joblib
+            joblib.dump(model, model_path)
+            logger.info('Model saved to %s', model_path)
+        except Exception as e: # pylint: disable=broad-except
+            logger.error('Failed to save model: %s', e, exc_info=True)
+
+    logging.getLogger().removeHandler(file_handler)
+    file_handler.close()
+
+    return metrics
 
 
 def main_cli():
-    """Command-line interface for running experiments."""
+    """Command Line Interface for running experiments."""
     parser = argparse.ArgumentParser(
-        description="Run a machine learning experiment using a YAML configuration file."
+        description='Run a TabPFN experiment using a YAML configuration file.'
     )
     parser.add_argument(
-        "--config",
+        'config_path',
         type=str,
-        required=True,
-        help="Path to the YAML experiment configuration file."
+        help='Path to the experiment configuration YAML file.',
     )
     args = parser.parse_args()
 
     try:
-        run_single_experiment(args.config)
-    except Exception:
-        sys.exit(1)
+        run_single_experiment(args.config_path)
+        logger.info('Experiment finished successfully.')
+    except Exception as e: # pylint: disable=broad-except
+        logger.critical(
+            'CRITICAL ERROR in main_cli while running experiment: %s',
+            e,
+            exc_info=True,
+        )
+        raise
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main_cli()

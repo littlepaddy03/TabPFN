@@ -16,8 +16,8 @@ experiment_metadata:
 data:
   # IMPORTANT: Update these paths to your actual NPZ file locations
   # Paths can be absolute or relative to this config file's directory.
-  train_npz_path: "../experiment_outputs/train_processed.npz" # Example relative path
-  test_npz_path: "../experiment_outputs/test_processed.npz"   # Example relative path
+  train_npz_path: "/root/lanyun-tmp/datasets/us_processed/train_processed.npz" # Example relative path
+  test_npz_path: "/root/lanyun-tmp/datasets/us_processed/test_processed.npz"   # Example relative path
 
 # ==============================================================================
 # Model Configuration
