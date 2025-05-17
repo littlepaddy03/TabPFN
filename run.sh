@@ -1,0 +1,22 @@
+python main.py \
+    --train_file_path /root/lanyun-tmp/datasets/us_processed_cp/train_processed.npz \
+    --test_file_path /root/lanyun-tmp/datasets/us_processed_cp/test_processed.npz \
+    --output_dir_d1_encoder "./d1_encoder_results" \
+    --val_split_size 0.2 \
+    --random_seed 42 \
+    --standardize_agri_features True \
+    --handle_missing_agri_values "mean" \
+    --encoder_temporal_hidden_dim 128 \
+    --encoder_static_hidden_dims_str "64,32" \
+    --encoder_fusion_strategy "gated" \
+    --encoder_temporal_num_heads 4 \
+    --encoder_lr 0.001 \
+    --encoder_weight_decay 0.00001 \
+    --encoder_batch_size 64 \
+    --encoder_num_epochs 50 \
+    --encoder_scheduler_step_size 15 \
+    --encoder_scheduler_gamma 0.5 \
+    --encoder_early_stopping_patience 7 \
+    --mlflow_experiment_name "My_Agri_Encoder_Experiment" \
+    --mlflow_run_name "D1_Run_LSTM_MLP_Concat" \
+    --require_core_classes
