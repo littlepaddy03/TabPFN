@@ -1,0 +1,15 @@
+artifact_uri: file:///root/lanyun-tmp/TabPFN/mlruns/860405240766855504/d038c768548d4727b70cffdb4c9539fc/artifacts
+end_time: 1747445658033
+entry_point_name: ''
+experiment_id: '860405240766855504'
+lifecycle_stage: active
+run_id: d038c768548d4727b70cffdb4c9539fc
+run_name: D1b_Benchmark_Gated_20250517_093324_d1b_tabpfn_benchmark
+run_uuid: d038c768548d4727b70cffdb4c9539fc
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1747445611056
+status: 3
+tags: []
+user_id: root

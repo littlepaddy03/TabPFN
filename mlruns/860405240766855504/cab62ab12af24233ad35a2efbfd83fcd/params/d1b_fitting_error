@@ -1,0 +1,1 @@
+Number of samples 69248 in the input data is greater than the maximum number of samples 10000 officially supported by TabPFN. Set `ignore_pretraining_limits=True` to override this error!
