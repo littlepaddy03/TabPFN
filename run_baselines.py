@@ -14,22 +14,29 @@
 
 """Main script for running baseline models for agricultural yield prediction.
 
-Step 4: Training and evaluation workflow for a single baseline model.
+Step 6: Integrate MLflow for experiment tracking.
 """
 
 import argparse
 import numpy as np
 import os
 import traceback
-from typing import Dict, Any # 添加 Any
+from typing import Dict, Any, List
+import joblib # 用于保存scaler
+import pandas as pd # 用于保存预测结果
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression # 导入线性回归模型
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.dummy import DummyRegressor
+
+import mlflow # 导入 mlflow
+import mlflow.sklearn # 导入 mlflow.sklearn
 
 try:
   import load_data
   from src.tabpfn.agri_utils.baseline_featurizer import featurize_3d_to_2d
-  import evaluate # 导入评估模块
+  import evaluate
 except ImportError as e:
   print(f"Error importing modules: {e}")
   print("Please ensure 'load_data.py', 'evaluate.py' are accessible and "
@@ -42,10 +49,14 @@ except ImportError as e:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TRAIN_DATA_PATH = '/root/lanyun-tmp/datasets/us_processed_cp/train_processed.npz'
 DEFAULT_TEST_DATA_PATH = '/root/lanyun-tmp/datasets/us_processed_cp/test_processed.npz'
+DEFAULT_MLFLOW_EXPERIMENT_NAME = "Baseline Models - Agri Yield Prediction" # MLflow 实验名称
 
 VAL_SPLIT_SIZE = 0.2
 RANDOM_SEED = 42
 AGGREGATION_FUNCTIONS = ['mean', 'std']
+
+RF_N_ESTIMATORS = 100
+RF_MAX_DEPTH = 10
 
 
 def adapt_info_keys(original_info: Dict) -> Dict:
@@ -67,44 +78,48 @@ def adapt_info_keys(original_info: Dict) -> Dict:
     ) from e
   return adapted
 
-def train_and_evaluate_model(
+def train_and_evaluate_model( # 返回训练好的模型和预测结果
     model_name: str,
-    model_instance: Any, # scikit-learn 模型实例
+    model_instance: Any,
     x_train: np.ndarray,
-    y_train: np.ndarray, # 标准化后的y_train_scaled (n_samples, 1)
+    y_train: np.ndarray,
     x_val: np.ndarray,
-    y_val_original: np.ndarray, # 原始尺度的y_val (n_samples,)
+    y_val_original: np.ndarray,
     x_test: np.ndarray,
-    y_test_original: np.ndarray, # 原始尺度的y_test (n_samples,)
+    y_test_original: np.ndarray,
     y_scaler: StandardScaler
 ) -> Dict:
-    """Trains a model, evaluates it on validation and test sets."""
+    """Trains a model, evaluates it, and returns model, metrics, and predictions."""
     print(f"\n--- Training and Evaluating: {model_name} ---")
-    results = {"model_name": model_name}
+    # model_instance 在这里被 fit，所以它会被修改并成为训练好的模型
+    results = {
+        "model_name": model_name,
+        "fitted_model": None, # 初始化
+        "validation_metrics": None,
+        "test_metrics": None,
+        "y_val_pred_original": None,
+        "y_test_pred_original": None,
+        "error": None
+        }
 
     try:
-        # 训练模型
-        # 注意: scikit-learn的fit通常期望y是1D的，所以使用.ravel()
         print(f"   Training {model_name}...")
         model_instance.fit(x_train, y_train.ravel())
+        results["fitted_model"] = model_instance # 保存训练好的模型
         print(f"   {model_name} trained successfully.")
 
-        # 在验证集上预测和评估
         print("   Evaluating on validation set...")
         y_val_pred_scaled = model_instance.predict(x_val)
-        # 逆标准化预测结果
         y_val_pred_original = y_scaler.inverse_transform(y_val_pred_scaled.reshape(-1, 1)).ravel()
-        
+        results["y_val_pred_original"] = y_val_pred_original
         val_metrics = evaluate.calculate_regression_metrics(y_val_original, y_val_pred_original)
         results["validation_metrics"] = val_metrics
         print(f"   Validation Metrics: {val_metrics}")
 
-        # 在测试集上预测和评估
         print("   Evaluating on test set...")
         y_test_pred_scaled = model_instance.predict(x_test)
-        # 逆标准化预测结果
         y_test_pred_original = y_scaler.inverse_transform(y_test_pred_scaled.reshape(-1, 1)).ravel()
-
+        results["y_test_pred_original"] = y_test_pred_original
         test_metrics = evaluate.calculate_regression_metrics(y_test_original, y_test_pred_original)
         results["test_metrics"] = test_metrics
         print(f"   Test Metrics: {test_metrics}")
@@ -118,19 +133,27 @@ def train_and_evaluate_model(
 
 
 def main(args):
-  """主函数：加载数据，转换特征，标准化，训练和评估单个模型。"""
-  print("--- 步骤4：单个基线模型的训练与评估流程 ---")
+  """主函数：加载数据，转换特征，标准化，训练和评估多个基线模型，并使用MLflow追踪。"""
+  print(f"--- 步骤6：集成 MLflow 进行实验追踪 ---")
+  print(f"MLflow Experiment Name: {args.mlflow_experiment_name}")
+  print(f"MLflow Tracking URI: {mlflow.get_tracking_uri()}")
+
+  # 设置 MLflow 实验
+  try:
+    experiment = mlflow.get_experiment_by_name(args.mlflow_experiment_name)
+    if experiment is None:
+        print(f"Experiment '{args.mlflow_experiment_name}' not found, creating new experiment.")
+        mlflow.create_experiment(args.mlflow_experiment_name)
+    mlflow.set_experiment(args.mlflow_experiment_name)
+  except Exception as e:
+      print(f"Could not set MLflow experiment: {e}")
+      print("Please ensure MLflow server is running or tracking URI is correctly configured.")
+      # return # 可以选择在这里退出，或者让后续的mlflow调用失败
 
   train_data_path = args.train_data_path
   test_data_path = args.test_data_path
 
-  if not os.path.exists(train_data_path):
-    print(f"错误：训练数据文件未找到于 {train_data_path}")
-    return
-  if not os.path.exists(test_data_path):
-    print(f"错误：测试数据文件未找到于 {test_data_path}")
-    return
-
+  # ... (数据加载、拆分、3D->2D转换、标准化的代码与步骤5相同) ...
   # 1. 加载数据
   print(f"\n1. 从 '{train_data_path}' 加载原始训练数据...")
   try:
@@ -146,7 +169,7 @@ def main(args):
   try:
     x_train_3d, x_val_3d, y_train_original, y_val_original = load_data.split_data(
         x_full_train_3d,
-        y_full_train_original, # 使用带 _original 后缀的变量以示区分
+        y_full_train_original,
         test_size=args.val_split_size,
         random_state=args.random_seed)
   except Exception as e:
@@ -181,69 +204,161 @@ def main(args):
   try:
     y_train_original_reshaped = y_train_original.reshape(-1, 1)
     x_train_scaled = x_scaler.fit_transform(x_train_2d)
-    y_train_scaled = y_scaler.fit_transform(y_train_original_reshaped) # y_train_scaled 是标准化后的
+    y_train_scaled = y_scaler.fit_transform(y_train_original_reshaped)
 
     x_val_scaled = x_scaler.transform(x_val_2d)
-    # y_val_scaled 不需要显式创建，因为我们直接用 y_val_original 进行评估
     x_test_scaled = x_scaler.transform(x_test_2d)
-    # y_test_scaled 也不需要显式创建
     print("   特征和目标标准化完成。")
   except Exception as e:
     print(f"标准化数据时出错: {e}")
     traceback.print_exc()
     return
 
-  # 4. 训练和评估单个基线模型 (例如，LinearRegression)
-  print("\n4. 训练和评估基线模型...")
-  
-  # 实例化模型
-  linear_model = LinearRegression()
+  # 定义要训练和评估的基线模型列表
+  baseline_models_config = [
+      {
+          "name": "MeanPredictor",
+          "instance": DummyRegressor(strategy="mean"),
+          "params": {"strategy": "mean"} # 记录 DummyRegressor 的参数
+      },
+      {
+          "name": "LinearRegression",
+          "instance": LinearRegression(),
+          "params": {} # LinearRegression 使用默认参数
+      },
+      {
+          "name": "RandomForestRegressor_Simple",
+          "instance": RandomForestRegressor(
+              n_estimators=RF_N_ESTIMATORS,
+              max_depth=RF_MAX_DEPTH,
+              random_state=args.random_seed,
+              n_jobs=-1
+          ),
+          "params": { # 记录 RandomForest 的参数
+              "n_estimators": RF_N_ESTIMATORS,
+              "max_depth": RF_MAX_DEPTH,
+              "random_state": args.random_seed
+          }
+      }
+  ]
 
-  # 调用训练和评估函数
-  # 注意：传递给 y_train 的是 y_train_scaled
-  # 传递给 y_val_original 和 y_test_original 的是原始未缩放的目标值
-  lr_results = train_and_evaluate_model(
-      model_name="LinearRegression",
-      model_instance=linear_model,
-      x_train=x_train_scaled,
-      y_train=y_train_scaled, # 使用标准化后的y进行训练
-      x_val=x_val_scaled,
-      y_val_original=y_val_original, # 使用原始y进行评估
-      x_test=x_test_scaled,
-      y_test_original=y_test_original, # 使用原始y进行评估
-      y_scaler=y_scaler # 传递y_scaler用于逆标准化
-  )
-  
-  print(f"\nLinear Regression 最终结果: {lr_results}")
+  all_run_results = []
 
-  print("\n--- 单个基线模型训练与评估完成 ---")
+  print("\n4. 训练、评估并使用 MLflow 追踪所有基线模型...")
+  for model_config in baseline_models_config:
+    model_name = model_config["name"]
+    model_instance = model_config["instance"] # model_instance 会在 train_and_evaluate_model 中被 fit
+    model_params_to_log = model_config["params"]
+
+    with mlflow.start_run(run_name=model_name): # 为每个模型开始一个新的 MLflow run
+      print(f"\nStarting MLflow run for: {model_name}")
+      
+      # 记录一般参数
+      mlflow.log_param("model_name", model_name)
+      mlflow.log_param("random_seed", args.random_seed)
+      mlflow.log_param("val_split_size", args.val_split_size)
+      mlflow.log_param("aggregation_functions", str(AGGREGATION_FUNCTIONS))
+      
+      # 记录模型特定参数
+      for param_name, param_value in model_params_to_log.items():
+          mlflow.log_param(param_name, param_value)
+
+      # 训练和评估
+      # train_and_evaluate_model 现在返回一个包含 "fitted_model" 的字典
+      run_result_dict = train_and_evaluate_model(
+          model_name=model_name, # 传递给函数内打印
+          model_instance=model_instance, # 这个实例会被fit
+          x_train=x_train_scaled,
+          y_train=y_train_scaled,
+          x_val=x_val_scaled,
+          y_val_original=y_val_original,
+          x_test=x_test_scaled,
+          y_test_original=y_test_original,
+          y_scaler=y_scaler
+      )
+      all_run_results.append(run_result_dict)
+
+      if run_result_dict.get("error"):
+          mlflow.set_tag("status", "FAILED")
+          mlflow.log_param("error_message", run_result_dict["error"])
+          print(f"MLflow run for {model_name} marked as FAILED.")
+      else:
+          # 记录指标
+          if run_result_dict.get("validation_metrics"):
+              for metric_name, metric_value in run_result_dict["validation_metrics"].items():
+                  mlflow.log_metric(f"val_{metric_name}", metric_value)
+          if run_result_dict.get("test_metrics"):
+              for metric_name, metric_value in run_result_dict["test_metrics"].items():
+                  mlflow.log_metric(f"test_{metric_name}", metric_value)
+          
+          # 记录模型
+          fitted_model = run_result_dict.get("fitted_model")
+          if fitted_model:
+              mlflow.sklearn.log_model(fitted_model, "model")
+              print(f"   Logged model '{model_name}' to MLflow.")
+
+          # (可选) 记录 Scalers 作为 artifact
+          # 为了简单起见，我们可以将它们保存在临时文件中然后记录
+          scaler_path_dir = "scalers"
+          if not os.path.exists(scaler_path_dir):
+              os.makedirs(scaler_path_dir)
+          
+          x_scaler_path = os.path.join(scaler_path_dir, f"{model_name}_x_scaler.joblib")
+          y_scaler_path = os.path.join(scaler_path_dir, f"{model_name}_y_scaler.joblib")
+          joblib.dump(x_scaler, x_scaler_path)
+          joblib.dump(y_scaler, y_scaler_path)
+          mlflow.log_artifact(x_scaler_path, artifact_path="scalers")
+          mlflow.log_artifact(y_scaler_path, artifact_path="scalers")
+          print(f"   Logged scalers to MLflow artifacts path 'scalers'.")
+
+          # (可选) 记录测试集预测结果作为 artifact
+          if run_result_dict.get("y_test_pred_original") is not None:
+              predictions_df = pd.DataFrame({
+                  'y_true': y_test_original.ravel(),
+                  'y_pred': run_result_dict["y_test_pred_original"].ravel()
+              })
+              predictions_path_dir = "predictions"
+              if not os.path.exists(predictions_path_dir):
+                  os.makedirs(predictions_path_dir)
+              predictions_csv_path = os.path.join(predictions_path_dir, f"{model_name}_test_predictions.csv")
+              predictions_df.to_csv(predictions_csv_path, index=False)
+              mlflow.log_artifact(predictions_csv_path, artifact_path="predictions")
+              print(f"   Logged test predictions to MLflow artifacts path 'predictions'.")
+
+          mlflow.set_tag("status", "SUCCESS")
+          print(f"MLflow run for {model_name} completed and logged.")
+  
+  print("\n--- 所有基线模型评估汇总 (与步骤5相同，MLflow是主要记录方式) ---")
+  for result in all_run_results:
+      print(f"模型: {result.get('model_name')}")
+      if "error" in result and result['error']:
+          print(f"  错误: {result['error']}")
+      else:
+          print(f"  验证集指标: {result.get('validation_metrics')}")
+          print(f"  测试集指标: {result.get('test_metrics')}")
+      print("-" * 30)
+
+  print("\n--- 所有基线模型训练、评估和MLflow追踪完成 ---")
 
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(
-      description="Run baseline models for agricultural yield prediction."
+      description="Run baseline models for agricultural yield prediction with MLflow tracking."
   )
   parser.add_argument(
-      "--train_data_path",
-      type=str,
-      default=DEFAULT_TRAIN_DATA_PATH,
-      help="Path to the training data NPZ file (train_processed.npz)",
-  )
+      "--train_data_path", type=str, default=DEFAULT_TRAIN_DATA_PATH,
+      help="Path to the training data NPZ file (train_processed.npz)")
   parser.add_argument(
-      "--test_data_path",
-      type=str,
-      default=DEFAULT_TEST_DATA_PATH,
-      help="Path to the test data NPZ file (test_processed.npz)",
-  )
+      "--test_data_path", type=str, default=DEFAULT_TEST_DATA_PATH,
+      help="Path to the test data NPZ file (test_processed.npz)")
   parser.add_argument(
-      "--val_split_size",
-      type=float,
-      default=VAL_SPLIT_SIZE,
-      help="Fraction of training data to use for validation.",
-  )
+      "--val_split_size", type=float, default=VAL_SPLIT_SIZE,
+      help="Fraction of training data to use for validation.")
   parser.add_argument(
-      "--random_seed", type=int, default=RANDOM_SEED, help="Random seed."
-  )
+      "--random_seed", type=int, default=RANDOM_SEED, help="Random seed.")
+  parser.add_argument(
+      "--mlflow_experiment_name", type=str, default=DEFAULT_MLFLOW_EXPERIMENT_NAME,
+      help="Name of the MLflow experiment to use/create.")
+  
   args = parser.parse_args()
-
   main(args)
