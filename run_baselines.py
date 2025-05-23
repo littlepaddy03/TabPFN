@@ -55,7 +55,7 @@ DEFAULT_MLFLOW_EXPERIMENT_NAME = "Baseline Models - Agri Yield - With Encoded Cr
 
 VAL_SPLIT_SIZE = 0.2
 RANDOM_SEED = 42
-AGGREGATION_FUNCTIONS = ['mean', 'std']
+AGGREGATION_FUNCTIONS = ['mean', 'std', 'median', 'min', 'max', 'sum', 'count_nan', 'count_valid']
 
 RF_N_ESTIMATORS = 100
 RF_MAX_DEPTH = 10

@@ -20,12 +20,14 @@ Script to preprocess agricultural datasets for TabPFN adaptation.
 This script reads CSV data, processes samples, pads/truncates sequences,
 combines with static features (now including numerically encoded crop type),
 and saves processed data as .npz files. Test data is also saved per crop.
+Training data can also be saved per crop.
 """
 import argparse
 import os
 import logging
 from typing import List, Dict, Tuple, Any, Optional
-import gc 
+import gc
+import re # 导入 re模块
 
 import numpy as np
 import pandas as pd
@@ -41,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 # Define default column names
 DEFAULT_TEMPORAL_COLS = [
-    'NDVI', 'Wind_Speed_10m_Mean', 'Temperature_Air_2m_Min_24h', 
+    'NDVI', 'Wind_Speed_10m_Mean', 'Temperature_Air_2m_Min_24h',
     'Temperature_Air_2m_Max_24h', 'Temperature_Air_2m_Mean_24h',
     'Temperature_Air_2m_Max_Day_Time', 'Temperature_Air_2m_Mean_Day_Time',
     'Temperature_Air_2m_Min_Night_Time', 'Temperature_Air_2m_Mean_Night_Time',
@@ -88,9 +90,26 @@ DEFAULT_STATIC_COLS_ORIGINAL = [ # 原有的静态特征列
 ENCODED_CROP_LABEL_COL = 'crop_label_encoded' # 新的编码作物特征列名
 
 DEFAULT_TARGET_COL = 'yield'
-DEFAULT_CROP_COL = 'crop' 
+DEFAULT_CROP_COL = 'crop'
 DEFAULT_GROUP_COLS = ['year', DEFAULT_CROP_COL, 'longitude', 'latitude']
 DEFAULT_TIME_COL = 'date'
+
+
+def sanitize_crop_name_for_filename(crop_name: str) -> str:
+    """
+    Cleans a crop name to be safely used in a filename.
+    Replaces common delimiters and spaces with underscores, removes other special chars.
+    """
+    name = str(crop_name) # Ensure it's a string
+    # Replace common delimiters and multiple spaces with a single underscore
+    name = re.sub(r"[,\s\-/]+", "_", name)
+    # Remove any characters not suitable for filenames (allow alphanumeric and underscore)
+    name = re.sub(r"[^a-zA-Z0-9_]", "", name)
+    # Consolidate multiple underscores
+    name = re.sub(r"_+", "_", name)
+    # Remove leading/trailing underscores
+    name = name.strip("_")
+    return name.lower() or "unknown_crop" # Ensure not empty
 
 
 def load_and_combine_csvs_from_dir(directory_path: str) -> Optional[pd.DataFrame]:
@@ -147,7 +166,7 @@ def process_sample_group(
     # 处理静态特征 (现在包括编码后的作物标签)
     for col in static_cols: # static_cols 现在包含了 ENCODED_CROP_LABEL_COL
         if col not in temp_df_copy.columns: temp_df_copy.loc[:, col] = np.nan
-    
+
     static_data_series = temp_df_copy[static_cols].iloc[0] # 取第一行作为静态值
     static_data_np = static_data_series.astype(np.float32).values
     static_data_expanded = np.repeat(static_data_np[:, np.newaxis], max_len, axis=1)
@@ -172,7 +191,8 @@ def process_dataframe_and_save_npz(
     crop_identity_col: str, # 原始的作物文本列名 (e.g., 'crop')
     split_name: str,
     label_encoder: Optional[LabelEncoder] = None, # 传入拟合好的 LabelEncoder
-    crop_label_mapping: Optional[Dict[str, int]] = None # 传入作物名称到整数的映射
+    crop_label_mapping: Optional[Dict[str, int]] = None, # 传入作物名称到整数的映射
+    train_per_crop_prefix: Optional[str] = None # 新增：用于训练集按作物保存的前缀
 ):
     if df is None or df.empty:
         logger.warning(f"DataFrame for {split_name} is empty. Skipping NPZ for {output_filepath}")
@@ -184,20 +204,14 @@ def process_dataframe_and_save_npz(
     if label_encoder and crop_identity_col in df.columns:
         logger.info(f"Applying LabelEncoder to '{crop_identity_col}' column for {split_name} data.")
         try:
-            # 对于测试集中可能出现的新作物（未在训练集中fit过的），LabelEncoder会报错
-            # 因此，确保LabelEncoder在所有唯一作物上拟合，或者处理未知标签
-            # 当前实现是在main函数中用train+test的所有作物拟合label_encoder
-            df[ENCODED_CROP_LABEL_COL] = label_encoder.transform(df[crop_identity_col])
+            df[ENCODED_CROP_LABEL_COL] = label_encoder.transform(df[crop_identity_col].astype(str)) # 确保是字符串
             df[ENCODED_CROP_LABEL_COL] = df[ENCODED_CROP_LABEL_COL].astype(np.float32) # 确保是数值类型
         except ValueError as e:
             logger.error(f"Error transforming '{crop_identity_col}' using LabelEncoder for {split_name}: {e}")
-            logger.error(f"This might happen if test set contains crop labels not seen during LabelEncoder fitting.")
-            logger.error(f"Unique crops in current df: {df[crop_identity_col].unique()}")
-            logger.error(f"LabelEncoder was fit on: {label_encoder.classes_}")
-            # 可以选择填充一个特殊值或跳过这些样本
-            # For now, let it raise or handle as NaN if it becomes one.
-            # A robust solution would be to map unknown to a specific category or use a try-except per row.
-            # For simplicity, we assume label_encoder is fit on all possible crops.
+            logger.error(f"This might happen if data contains crop labels not seen during LabelEncoder fitting.")
+            unknown_labels = set(df[crop_identity_col].astype(str).unique()) - set(label_encoder.classes_)
+            logger.error(f"Unknown labels found: {unknown_labels}")
+            logger.error(f"LabelEncoder was fit on: {list(label_encoder.classes_)}")
             df[ENCODED_CROP_LABEL_COL] = -1 #  标记为未知/错误
             df[ENCODED_CROP_LABEL_COL] = df[ENCODED_CROP_LABEL_COL].astype(np.float32)
 
@@ -214,9 +228,8 @@ def process_dataframe_and_save_npz(
 
     processed_features_list: List[np.ndarray] = []
     processed_targets_list: List[float] = []
-    processed_crop_names_list: List[str] = []
+    processed_crop_names_list: List[str] = [] # 用于按作物筛选
 
-    # static_cols 已经包含了 ENCODED_CROP_LABEL_COL (由main函数传入)
     expected_num_feature_rows = len(temporal_cols) + len(static_cols)
     expected_feature_shape = (expected_num_feature_rows, args.max_len)
 
@@ -224,18 +237,21 @@ def process_dataframe_and_save_npz(
     for i, (_group_name, group_df) in enumerate(grouped):
         if i % 20000 == 0 and i > 0: logger.info(f"Processing group {i}/{len(grouped)} for {split_name}...")
         processed_sample = process_sample_group(
-            group_df, temporal_cols, static_cols, target_col, args.max_len, group_cols
+            group_df, temporal_cols, static_cols, target_col, args.max_len, group_cols + [crop_identity_col] # 确保 crop_identity_col 在元信息中
         )
         if processed_sample:
             feature_array, target_value, sample_meta_info = processed_sample
             if feature_array.shape != expected_feature_shape:
+                logger.warning(f"Skipping group due to unexpected feature shape {feature_array.shape}, expected {expected_feature_shape}")
                 skipped_count += 1; continue
             processed_features_list.append(feature_array)
             processed_targets_list.append(target_value)
             try:
-                crop_name = str(sample_meta_info[crop_identity_col])
-                processed_crop_names_list.append(crop_name)
+                # 使用原始 crop_identity_col (文本) 来追踪作物名
+                crop_name_original = str(sample_meta_info[crop_identity_col])
+                processed_crop_names_list.append(crop_name_original)
             except KeyError:
+                logger.warning(f"KeyError: '{crop_identity_col}' not found in sample_meta_info for a group. Using 'unknown_crop'. Keys: {sample_meta_info.keys()}")
                 processed_crop_names_list.append("unknown_crop")
             processed_count +=1
         else: skipped_count += 1
@@ -250,7 +266,7 @@ def process_dataframe_and_save_npz(
     del processed_features_list; gc.collect()
 
     all_targets_np = np.array(processed_targets_list, dtype=np.float32)
-    all_crop_names_np = np.array(processed_crop_names_list)
+    all_crop_names_np = np.array(processed_crop_names_list) # 现在是原始作物名称字符串数组
     if all_features_np.shape[0] != all_crop_names_np.shape[0] and all_crop_names_np.size > 0:
         logger.error(f"Mismatch: features ({all_features_np.shape[0]}) vs crop names ({all_crop_names_np.shape[0]}) for {split_name}. Aborting."); return
 
@@ -261,16 +277,16 @@ def process_dataframe_and_save_npz(
     info_dict = {
         "description": f"Processed agricultural data for TabPFN - {split_name} set.",
         "split_type": split_name, "max_len": args.max_len,
-        "temporal_cols_used": temporal_cols, "static_cols_used": static_cols, # static_cols now includes encoded crop
+        "temporal_cols_used": temporal_cols, "static_cols_used": static_cols,
         "target_col": target_col, "group_cols": group_cols, "time_col": args.time_col,
         "num_temporal_features": len(temporal_cols),
-        "num_static_features": len(static_cols), # This count is now correct
+        "num_static_features": len(static_cols),
         "static_feature_start_row_index_in_sample_matrix": static_feature_row_index,
         "total_feature_rows_per_sample": all_features_np.shape[1] if all_features_np.ndim == 3 else -1,
         "n_samples_in_split": all_features_np.shape[0],
-        "crop_identity_col_used": crop_identity_col, # Original crop column name
-        "encoded_crop_label_col_name": ENCODED_CROP_LABEL_COL, # Name of the new encoded column
-        "crop_label_mapping": crop_label_mapping # Save the mapping
+        "crop_identity_col_used": crop_identity_col,
+        "encoded_crop_label_col_name": ENCODED_CROP_LABEL_COL,
+        "crop_label_mapping": crop_label_mapping
     }
     logger.info(f"Global metadata for {split_name} (info_dict, excerpt): "
                 f"num_static_features={info_dict['num_static_features']}, "
@@ -279,24 +295,61 @@ def process_dataframe_and_save_npz(
     np.savez_compressed(output_filepath, features=all_features_np, targets=all_targets_np, info=info_dict)
     logger.info(f"{split_name.capitalize()} data saved to {output_filepath}.")
 
-    if split_name == 'test':
+    # --- 新增：为训练集按作物保存独立文件 ---
+    if split_name == 'train' and train_per_crop_prefix:
+        logger.info(f"--- Generating per-crop training NPZ files for '{split_name}' split using prefix '{train_per_crop_prefix}' ---")
+        if not all_crop_names_np.size:
+            logger.info("No crop names available for train split, cannot save per-crop training files.")
+        else:
+            unique_crops_in_train = np.unique(all_crop_names_np) # all_crop_names_np contains original string names
+            base_output_dir = os.path.dirname(output_filepath)
+
+            for crop_val_original in unique_crops_in_train:
+                sanitized_crop_name = sanitize_crop_name_for_filename(crop_val_original)
+                
+                mask = (all_crop_names_np == crop_val_original)
+                features_crop_specific = all_features_np[mask]
+                targets_crop_specific = all_targets_np[mask]
+
+                if features_crop_specific.shape[0] == 0:
+                    logger.info(f"No samples for crop '{crop_val_original}' in train split after filtering. Skipping.")
+                    continue
+
+                info_crop_specific = info_dict.copy()
+                info_crop_specific['description'] = f"Processed agricultural data for TabPFN - train set - CROP: {crop_val_original}."
+                info_crop_specific['filtered_for_crop'] = crop_val_original # Store original crop name
+                info_crop_specific['n_samples_in_split'] = features_crop_specific.shape[0]
+                info_crop_specific['split_type'] = f"train_{sanitized_crop_name}" # Use sanitized name for split_type consistency
+
+                output_filename_crop = f"{train_per_crop_prefix}{sanitized_crop_name}.npz"
+                output_file_path_crop = os.path.join(base_output_dir, output_filename_crop)
+                
+                logger.info(f"Saving training data for crop '{crop_val_original}' to {output_file_path_crop} ({features_crop_specific.shape[0]} samples)...")
+                np.savez_compressed(output_file_path_crop, features=features_crop_specific,
+                                    targets=targets_crop_specific, info=info_crop_specific)
+            logger.info(f"Finished saving per-crop training files to {base_output_dir}.")
+    # --- 结束新增 ---
+
+    if split_name == 'test': # 已有的测试集按作物保存逻辑
         if not all_crop_names_np.size: logger.info("No crop names for test split, cannot save per-crop files."); return
         unique_crops_in_test = np.unique(all_crop_names_np)
         base_output_dir = os.path.dirname(output_filepath)
         original_test_filename_stem = os.path.splitext(os.path.basename(output_filepath))[0]
         for crop_val in unique_crops_in_test:
-            sanitized_crop_name = "".join(c if c.isalnum() else "_" for c in str(crop_val)) or "unknown_crop"
+            sanitized_crop_name = sanitize_crop_name_for_filename(str(crop_val))
             mask = (all_crop_names_np == crop_val)
             features_crop_specific = all_features_np[mask]
             targets_crop_specific = all_targets_np[mask]
             if features_crop_specific.shape[0] == 0: continue
             info_crop_specific = info_dict.copy()
             info_crop_specific['description'] = f"Processed agricultural data for TabPFN - test set - CROP: {crop_val}."
-            info_crop_specific['filtered_for_crop'] = crop_val
+            info_crop_specific['filtered_for_crop'] = str(crop_val)
             info_crop_specific['n_samples_in_split'] = features_crop_specific.shape[0]
+            info_crop_specific['split_type'] = f"test_{sanitized_crop_name}"
+
             output_filename_crop = f"{original_test_filename_stem}_{sanitized_crop_name}.npz"
             output_file_path_crop = os.path.join(base_output_dir, output_filename_crop)
-            logger.info(f"Saving test data for crop '{crop_val}' to {output_file_path_crop}...")
+            logger.info(f"Saving test data for crop '{crop_val}' to {output_file_path_crop} ({features_crop_specific.shape[0]} samples)...")
             np.savez_compressed(output_file_path_crop, features=features_crop_specific,
                                 targets=targets_crop_specific, info=info_crop_specific)
         logger.info(f"Finished saving per-crop test files to {base_output_dir}.")
@@ -307,13 +360,11 @@ def main(args: argparse.Namespace):
     os.makedirs(args.output_dir, exist_ok=True)
 
     temporal_cols = args.temporal_cols if args.temporal_cols else DEFAULT_TEMPORAL_COLS
-    # static_cols WILL BE MODIFIED to include the encoded crop label
     base_static_cols = args.static_cols if args.static_cols else DEFAULT_STATIC_COLS_ORIGINAL.copy()
     target_col = args.target_col if args.target_col else DEFAULT_TARGET_COL
     group_cols = args.group_cols if args.group_cols else DEFAULT_GROUP_COLS.copy()
-    crop_identity_col = DEFAULT_CROP_COL # This is the original text column, e.g., 'crop'
+    crop_identity_col = DEFAULT_CROP_COL
     
-    # --- Step 1: Collect all unique crop names and fit LabelEncoder ---
     logger.info("Collecting all unique crop names from train and test data to fit LabelEncoder...")
     all_dfs_for_crop_scan: List[pd.DataFrame] = []
     train_dir_path_for_scan = os.path.join(args.base_data_dir, "train")
@@ -332,7 +383,7 @@ def main(args: argparse.Namespace):
         return
 
     combined_crops_df = pd.concat(all_dfs_for_crop_scan, ignore_index=True)
-    unique_crop_names = combined_crops_df[crop_identity_col].astype(str).unique() # Ensure string type for fitting
+    unique_crop_names = combined_crops_df[crop_identity_col].astype(str).unique()
     
     label_encoder = LabelEncoder()
     label_encoder.fit(unique_crop_names)
@@ -341,25 +392,15 @@ def main(args: argparse.Namespace):
     crop_label_mapping = {name: int(label) for name, label in zip(label_encoder.classes_, label_encoder.transform(label_encoder.classes_))}
     logger.info(f"Crop to Label Mapping: {crop_label_mapping}")
 
-    # Add the new encoded crop label column to the list of static columns
-    # This modified list will be used for processing both train and test data.
     final_static_cols = base_static_cols + [ENCODED_CROP_LABEL_COL]
     logger.info(f"Final static columns (including encoded crop): {final_static_cols}")
     logger.info(f"Total static features (including encoded crop): {len(final_static_cols)}")
 
-
-    # --- Process Training Data ---
-    train_dir_path = os.path.join(args.base_data_dir, "train")
-    logger.info(f"--- Processing Training Data from {train_dir_path} ---")
-    # train_df_combined was df_train_scan, can reuse or reload if memory is a concern
-    train_df_combined = df_train_scan if df_train_scan is not None else load_and_combine_csvs_from_dir(train_dir_path)
-
-
+    train_df_combined = df_train_scan if df_train_scan is not None else load_and_combine_csvs_from_dir(train_dir_path_for_scan)
     if train_df_combined is not None and not train_df_combined.empty:
-        # Check for all necessary columns (including the original crop_identity_col for encoding)
         all_needed_cols_train = list(set(temporal_cols + base_static_cols + [target_col] + group_cols + 
                                          ([args.time_col] if args.time_col and args.time_col in train_df_combined.columns else []) +
-                                         [crop_identity_col])) # Ensure original crop_identity_col is checked
+                                         [crop_identity_col]))
         missing_cols_in_train_df = [col for col in all_needed_cols_train if col not in train_df_combined.columns]
         if missing_cols_in_train_df:
             logger.error(f"Combined training DataFrame is missing required columns: {missing_cols_in_train_df}.")
@@ -367,17 +408,14 @@ def main(args: argparse.Namespace):
             train_output_filepath = os.path.join(args.output_dir, args.train_output_filename)
             process_dataframe_and_save_npz(
                 train_df_combined, train_output_filepath, args,
-                temporal_cols, final_static_cols, target_col, group_cols, # Use final_static_cols
-                crop_identity_col, "train", label_encoder, crop_label_mapping
+                temporal_cols, final_static_cols, target_col, group_cols,
+                crop_identity_col, "train", label_encoder, crop_label_mapping,
+                train_per_crop_prefix=args.train_output_per_crop_prefix # Pass the new argument
             )
     else: logger.warning("No training data loaded. Skipping processing for training set.")
-    del train_df_combined, df_train_scan; gc.collect() # Free memory
+    del train_df_combined, df_train_scan; gc.collect()
 
-    # --- Process Testing Data ---
-    test_dir_path = os.path.join(args.base_data_dir, "test")
-    logger.info(f"--- Processing Testing Data from {test_dir_path} ---")
-    test_df_combined = df_test_scan if df_test_scan is not None else load_and_combine_csvs_from_dir(test_dir_path)
-
+    test_df_combined = df_test_scan if df_test_scan is not None else load_and_combine_csvs_from_dir(test_dir_path_for_scan)
     if test_df_combined is not None and not test_df_combined.empty:
         all_needed_cols_test = list(set(temporal_cols + base_static_cols + [target_col] + group_cols + 
                                         ([args.time_col] if args.time_col and args.time_col in test_df_combined.columns else []) +
@@ -389,11 +427,12 @@ def main(args: argparse.Namespace):
             test_output_filepath = os.path.join(args.output_dir, args.test_output_filename)
             process_dataframe_and_save_npz(
                 test_df_combined, test_output_filepath, args,
-                temporal_cols, final_static_cols, target_col, group_cols, # Use final_static_cols
+                temporal_cols, final_static_cols, target_col, group_cols,
                 crop_identity_col, "test", label_encoder, crop_label_mapping
+                # No train_per_crop_prefix for test split
             )
     else: logger.warning("No testing data loaded. Skipping processing for testing set.")
-    del test_df_combined, df_test_scan, combined_crops_df; gc.collect() # Free memory
+    del test_df_combined, df_test_scan, combined_crops_df; gc.collect()
 
     logger.info("Preprocessing finished for all specified data splits.")
 
@@ -402,7 +441,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess agricultural data for TabPFN.")
     parser.add_argument("--base_data_dir", type=str, required=True, help="Path to base dir with 'train'/'test' subdirs.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save processed .npz files.")
-    parser.add_argument("--max_len", type=int, default=128, help="Max length for temporal sequences.") # Adjusted default to match user's data
+    parser.add_argument("--max_len", type=int, default=128, help="Max length for temporal sequences.")
     parser.add_argument("--temporal_cols", nargs='+', default=None, help="Temporal feature column names.")
     parser.add_argument("--static_cols", nargs='+', default=None, help="Original static feature column names (excluding encoded crop).")
     parser.add_argument("--target_col", type=str, default=None, help="Target variable column name.")
@@ -410,6 +449,12 @@ if __name__ == "__main__":
     parser.add_argument("--time_col", type=str, default=DEFAULT_TIME_COL, help="Time/date column for sorting.")
     parser.add_argument("--train_output_filename", type=str, default="train_processed.npz")
     parser.add_argument("--test_output_filename", type=str, default="test_processed.npz")
+    # 新增命令行参数
+    parser.add_argument(
+        "--train_output_per_crop_prefix",
+        type=str,
+        default="train_processed_", # 默认前缀
+        help="Prefix for per-crop training NPZ files. Crop name will be appended (e.g., 'train_processed_corn.npz')."
+    )
     args = parser.parse_args()
     main(args)
-
