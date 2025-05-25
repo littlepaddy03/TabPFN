@@ -11,514 +11,684 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-为每种作物独立训练和评估基线回归模型，用于农业产量预测。
 
-该脚本负责：
-1. 解析命令行参数，指定包含按作物划分的数据的目录。
-2. 发现可用的作物类型。
-3. 对每种作物：
-    a. 加载其专属的训练和测试数据。
-    b. 使用 BaselineFeaturizer 将 3D 数据转换为 2D，并在当前作物数据上拟合。
-    c. 在当前作物数据上拟合特征和目标标准化器。
-    d. 训练和评估一系列基线模型（均值预测器、线性回归、随机森林）。
-    e. 使用 MLflow 记录实验参数、指标和针对该作物训练的模型。
-    f. 对特定作物进行预测值诊断。
+"""Main script for running baseline models for agricultural yield prediction.
+
+Utilizes numerically encoded crop type as an input feature.
 """
 
 import argparse
-import logging
-import os
-import re # 用于从文件名提取作物名称
-import sys
-from typing import Any, Dict, List, Tuple, Optional
-
-import mlflow
 import numpy as np
+import os
+import traceback
+from typing import Dict, Any, List, Tuple
+import joblib
 import pandas as pd
-from sklearn.model_selection import train_test_split
+import glob
+import re
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.dummy import DummyRegressor
 
-# Optuna (如果使用)
+import mlflow
+import mlflow.sklearn
+
 try:
-    import optuna
-    OPTUNA_AVAILABLE = True
-except ImportError:
-    OPTUNA_AVAILABLE = False
-    logger_optuna = logging.getLogger(__name__) # 在尝试导入后定义
-    logger_optuna.info("Optuna 未安装。如果请求，随机森林的超参数优化将被跳过。")
+  import load_data
+  from src.tabpfn.agri_utils.baseline_featurizer import featurize_3d_to_2d
+  import evaluate # 假设 evaluate.py 在同一目录或PYTHONPATH中
+except ImportError as e:
+  print(f"Error importing modules: {e}")
+  print("Please ensure 'load_data.py', 'evaluate.py' are accessible and "
+        "the 'src' directory is correctly structured.")
+  print("Current working directory:", os.getcwd())
+  exit(1)
 
 
-# 将 src 目录添加到 Python 路径
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
-)
+# --- 配置参数 ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_TRAIN_DATA_DIR = '/root/lanyun-tmp/datasets/us_processed_cp_v2/' # 假设新文件路径
+DEFAULT_TEST_DATA_DIR = '/root/lanyun-tmp/datasets/us_processed_cp_v2/'   # 假设新文件路径
+DEFAULT_MLFLOW_EXPERIMENT_NAME = "Baseline Models - Agri Yield - Single Crop Training"
 
-from src.tabpfn.agri_utils.data_loader import (
-    load_npz_data,
-    validate_data,
-    adapt_info_keys,
-)
-from src.tabpfn.agri_utils.baseline_featurizer import BaselineFeaturizer
-from evaluate import calculate_regression_metrics, log_metrics_to_mlflow
+VAL_SPLIT_SIZE = 0.2
+RANDOM_SEED = 42
+AGGREGATION_FUNCTIONS = ['mean', 'std', 'median', 'min', 'max', 'sum', 'count_nan', 'count_valid']
 
-# 配置日志记录器
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
-logger = logging.getLogger(__name__) # 主日志记录器
+RF_N_ESTIMATORS = 100
+RF_MAX_DEPTH = 10
 
-# 定义可以进行预测值诊断的作物名称列表 (这些名称应与从文件名中解析出的一致)
-CROP_NAMES_FOR_DIAGNOSTICS: List[str] = ["corn", "soybeans", "wheat_spring_excl_drum"]
-DEFAULT_TRAIN_FILE_PREFIX = "train_processed_"
-DEFAULT_TEST_FILE_PREFIX = "test_processed_"
+CROPS_FOR_DETAILED_DEBUG = ["corn", "wheat_spring_excl_drum", "soybeans"]
+ENCODED_CROP_FEATURE_COL_NAME = 'crop_label_encoded' # 与 preprocess_agri_datasets_cp_v2.py 中定义的一致
 
 
-class MeanPredictor(DummyRegressor):
-    """一个简单的预测器，总是预测训练集目标的均值。"""
-    def __init__(self):
-        super().__init__(strategy="mean")
+def adapt_info_keys(original_info: Dict, context: str = "Unknown") -> Dict:
+  """Adapts keys from load_data's info dict to what featurizer expects."""
+  adapted = {}
+  print(f"    Adapting info keys for {context}...")
+  try:
+    required_source_keys = [
+        'static_feature_start_row_index_in_sample_matrix',
+        'num_temporal_features', 'num_static_features',
+        'temporal_cols_used', 'static_cols_used', # 这些现在应该包含编码后的作物列
+        'encoded_crop_label_col_name', # 确认新键存在
+        'crop_label_mapping'           # 确认新键存在
+    ]
+    for key in required_source_keys:
+        if key not in original_info:
+            # 对于 crop_label_mapping，如果它不存在于旧的 info 中（例如处理旧数据），可以给一个默认值或警告
+            if key == 'crop_label_mapping' and 'encoded_crop_label_col_name' not in original_info:
+                 print(f"    警告 ({context}): '{key}' not found, and encoded crop label also not found. Proceeding without it.")
+                 adapted[key] = {} # 或者 None
+                 continue
+            elif key == 'encoded_crop_label_col_name' and 'crop_label_mapping' not in original_info:
+                 print(f"    警告 ({context}): '{key}' not found, and crop_label_mapping also not found. Proceeding without it.")
+                 adapted[key] = None # 或者 ""
+                 continue
+
+            raise KeyError(f"Source key '{key}' missing in original_info for {context}. Keys: {list(original_info.keys())}")
+
+    adapted['static_feature_row_index'] = original_info[
+        'static_feature_start_row_index_in_sample_matrix']
+    
+    num_temporal = original_info['num_temporal_features']
+    num_static = original_info['num_static_features'] # 这个值现在应该是 61 (原始) + 1 (编码作物) = 62
+    
+    print(f"      (adapt_info_keys for {context}) num_temporal: {num_temporal}, num_static: {num_static}")
+
+    adapted['temporal_cols_idx'] = list(range(num_temporal))
+    # 静态特征索引现在从 num_temporal 开始，直到 num_temporal + num_static -1
+    adapted['static_cols_idx'] = list(range(num_temporal, num_temporal + num_static))
+    
+    if 'max_len' in original_info: adapted['max_len'] = original_info['max_len']
+    
+    # 这些原始列名列表用于特征重要性分析，确保它们与 num_features 计数匹配
+    adapted['original_temporal_cols_used'] = original_info['temporal_cols_used']
+    adapted['original_static_cols_used'] = original_info['static_cols_used'] # 这个列表现在应该包含 ENCODED_CROP_FEATURE_COL_NAME
+
+    # 健全性检查
+    if len(adapted['temporal_cols_idx']) != len(original_info['temporal_cols_used']):
+        print(f"    警告 ({context}): 生成的 temporal_cols_idx 长度 ({len(adapted['temporal_cols_idx'])}) "
+              f"与 temporal_cols_used 长度 ({len(original_info['temporal_cols_used'])}) 不匹配。")
+    if len(adapted['static_cols_idx']) != len(original_info['static_cols_used']):
+        print(f"    警告 ({context}): 生成的 static_cols_idx 长度 ({len(adapted['static_cols_idx'])}) "
+              f"与 static_cols_used 长度 ({len(original_info['static_cols_used'])}) 不匹配。")
+    
+    adapted['encoded_crop_label_col_name'] = original_info['encoded_crop_label_col_name']
+    adapted['crop_label_mapping'] = original_info['crop_label_mapping']
+
+    print(f"    Adaptation successful for {context}. Num static features in adapted info: {len(adapted['static_cols_idx'])}")
+    if ENCODED_CROP_FEATURE_COL_NAME not in adapted['original_static_cols_used']:
+        print(f"    严重警告 ({context}): '{ENCODED_CROP_FEATURE_COL_NAME}' 未在 adapted['original_static_cols_used'] 中找到! "
+              f"列表内容: {adapted['original_static_cols_used']}")
 
 
-def parse_args() -> argparse.Namespace:
-    """解析命令行参数。"""
-    parser = argparse.ArgumentParser(
-        description="Run per-crop baseline regression models."
-    )
-    parser.add_argument(
-        "--train_crop_data_dir",
-        type=str,
-        required=True,
-        help="Directory containing per-crop training NPZ files (e.g., train_processed_corn.npz).",
-    )
-    parser.add_argument(
-        "--test_crop_data_dir",
-        type=str,
-        required=True,
-        help="Directory containing per-crop test NPZ files (e.g., test_processed_corn.npz).",
-    )
-    parser.add_argument(
-        "--train_file_prefix",
-        type=str,
-        default=DEFAULT_TRAIN_FILE_PREFIX,
-        help=f"Prefix for training NPZ files (default: '{DEFAULT_TRAIN_FILE_PREFIX}'). Crop name is expected after this prefix.",
-    )
-    parser.add_argument(
-        "--test_file_prefix",
-        type=str,
-        default=DEFAULT_TEST_FILE_PREFIX,
-        help=f"Prefix for test NPZ files (default: '{DEFAULT_TEST_FILE_PREFIX}'). Crop name is expected after this prefix.",
-    )
-    parser.add_argument(
-        "--exp_name",
-        type=str,
-        default="PerCrop_Baseline_Models_Experiment",
-        help="Name of the MLflow experiment.",
-    )
-    parser.add_argument(
-        "--run_name_prefix",
-        type=str,
-        default="PerCropBaselineRun",
-        help="Prefix for the MLflow main run name.",
-    )
-    parser.add_argument(
-        "--model_names",
-        nargs="+",
-        default=["MeanPredictor", "LinearRegression", "RandomForestRegressor_WithCropFeature"],
-        help="List of baseline models to run for each crop.",
-    )
-    parser.add_argument(
-        "--random_state", type=int, default=42, help="Random state for reproducibility."
-    )
-    parser.add_argument(
-        "--n_jobs", type=int, default=-1, help="Number of jobs for scikit-learn models (-1 uses all processors)."
-    )
+  except KeyError as e:
+    print(f"    错误 ({context}): Error adapting info keys: {e}. Original keys: {list(original_info.keys())}")
+    raise
+  return adapted
 
-    # BaselineFeaturizer 参数
-    parser.add_argument(
-        "--temporal_agg_methods",
-        nargs="+",
-        default=["mean", "std"],
-        help="List of aggregation methods for temporal features.",
-    )
-    parser.add_argument(
-        "--static_feature_usage_strategy",
-        type=str,
-        default="first_row",
-        choices=["first_row"], # 对于单作物，通常静态特征是一致的
-        help="Strategy to use static features from the 3D input.",
-    )
-    parser.add_argument(
-        "--scaler_type",
-        type=str,
-        default="StandardScaler",
-        choices=["StandardScaler", "MinMaxScaler", "None"],
-        help="Type of scaler to use for 2D features. 'None' for no scaling.",
-    )
-    parser.add_argument(
-        "--static_row_index_for_featurizer",
-        type=int,
-        default=-1,
-        help="Row index in the 3D sample matrix that contains static features for BaselineFeaturizer.",
-    )
-
-    # RandomForest 参数
-    parser.add_argument(
-        "--rf_n_estimators", type=int, default=100, help="Number of trees for RandomForest."
-    )
-    parser.add_argument(
-        "--rf_max_depth", type=int, default=None, help="Max depth for RandomForest."
-    )
-    parser.add_argument(
-        "--rf_min_samples_split", type=int, default=2, help="Min samples split for RandomForest."
-    )
-    parser.add_argument(
-        "--rf_min_samples_leaf", type=int, default=1, help="Min samples leaf for RandomForest."
-    )
-    # Optuna HPO for RandomForest
-    parser.add_argument(
-        "--enable_optuna_rfr",
-        action="store_true",
-        help="Enable Optuna hyperparameter optimization for RandomForestRegressor (per crop).",
-    )
-    parser.add_argument(
-        "--n_trials_rfr_optuna",
-        type=int,
-        default=20,
-        help="Number of Optuna trials for RandomForestRegressor HPO (per crop).",
-    )
-
-    args = parser.parse_args()
-    if args.enable_optuna_rfr and not OPTUNA_AVAILABLE:
-        logger.warning(
-            "Optuna HPO for RFR requested (--enable_optuna_rfr) but Optuna is not available. "
-            "Skipping HPO."
-        )
-        args.enable_optuna_rfr = False
-    return args
-
-
-def discover_crop_datasets(
-    data_dir: str, file_prefix: str
-) -> Dict[str, str]:
-    """
-    从给定目录中发现按作物划分的数据集文件。
+def discover_crop_train_files(train_data_dir: str, train_prefix: str) -> List[Dict[str, str]]:
+    """Discovers per-crop training NPZ files in a directory.
 
     Args:
-        data_dir: 包含数据文件的目录。
-        file_prefix: 数据文件的前缀 (例如 "train_processed_")。
+        train_data_dir: Directory to scan for training files.
+        train_prefix: Prefix of the training files (e.g., "train_processed_").
 
     Returns:
-        一个字典，键是作物名称，值是数据文件的完整路径。
+        A list of dictionaries, where each dictionary contains 'name' (crop name)
+        and 'path' (full file path).
     """
-    crop_datasets: Dict[str, str] = {}
-    if not os.path.isdir(data_dir):
-        logger.warning(f"Data directory not found: {data_dir}")
-        return crop_datasets
+    crop_files = []
+    if not os.path.isdir(train_data_dir):
+        print(f"警告: 训练数据目录 {train_data_dir} 不是一个有效目录。")
+        return crop_files
 
-    pattern = re.compile(rf"^{re.escape(file_prefix)}(.+)\.npz$")
-    for fname in os.listdir(data_dir):
-        match = pattern.match(fname)
+    pattern = os.path.join(train_data_dir, f"{train_prefix}*.npz")
+    discovered_files = glob.glob(pattern)
+
+    if not discovered_files:
+        print(f"警告: 在目录 {train_data_dir} 中未找到匹配前缀 '{train_prefix}' 的训练文件。")
+        return crop_files
+
+    for file_path in discovered_files:
+        filename = os.path.basename(file_path)
+        # Escape the prefix in case it contains special regex characters
+        escaped_prefix = re.escape(train_prefix)
+        match = re.match(rf"{escaped_prefix}(.+)\.npz", filename)
         if match:
             crop_name = match.group(1)
-            crop_datasets[crop_name] = os.path.join(data_dir, fname)
-    logger.info(f"Discovered {len(crop_datasets)} crop datasets in '{data_dir}' with prefix '{file_prefix}': {list(crop_datasets.keys())}")
-    return crop_datasets
+            crop_files.append({"name": crop_name, "path": file_path})
+        else:
+            print(f"警告: 无法从训练文件名 {filename} 中使用前缀 '{train_prefix}' 提取作物名称。")
+    
+    print(f"发现的训练作物文件: {[cf['name'] for cf in crop_files]}")
+    return crop_files
+
+def discover_test_sets(test_data_dir: str, test_prefix: str) -> List[Dict[str, str]]:
+    """Discovers per-crop test NPZ files in a directory.
+
+    Args:
+        test_data_dir: Directory to scan for test files.
+        test_prefix: Prefix of the test files (e.g., "test_processed_").
+
+    Returns:
+        A list of dictionaries, where each dictionary contains 'name' (crop name)
+        and 'path' (full file path).
+    """
+    test_sets = []
+    if not os.path.isdir(test_data_dir):
+        print(f"警告: 测试数据目录 {test_data_dir} 不是一个有效目录。")
+        return test_sets
+
+    pattern = os.path.join(test_data_dir, f"{test_prefix}*.npz")
+    per_crop_files = glob.glob(pattern)
+
+    if not per_crop_files:
+        print(f"警告: 在目录 {test_data_dir} 中未找到匹配前缀 '{test_prefix}' 的测试文件。")
+        return test_sets
+
+    for crop_file_path in per_crop_files:
+        filename = os.path.basename(crop_file_path)
+        # Escape the prefix in case it contains special regex characters
+        escaped_prefix = re.escape(test_prefix)
+        match = re.match(rf"{escaped_prefix}(.+)\.npz", filename)
+        if match:
+            crop_name = match.group(1)
+            test_sets.append({"name": crop_name, "path": crop_file_path})
+        else:
+            print(f"警告: 无法从测试文件名 {filename} 中使用前缀 '{test_prefix}' 提取作物名称。")
+            
+    print(f"发现的测试集作物文件: {[ts['name'] for ts in test_sets]}")
+    return test_sets
+
+def print_prediction_diagnostics(
+    y_original: np.ndarray, y_pred_scaled: np.ndarray, y_pred_original: np.ndarray,
+    y_scaler: StandardScaler, test_set_name: str
+):
+    # ... (与之前版本相同) ...
+    print(f"\n--- '{test_set_name}' 预测值诊断 ---")
+    print(f"  y_original 形状: {y_original.shape}, 前5个: {y_original[:5]}")
+    print(f"  y_pred_scaled (模型直接输出) 形状: {y_pred_scaled.shape}, 前5个: {y_pred_scaled[:5]}")
+    print(f"  y_pred_original (逆标准化后) 形状: {y_pred_original.shape}, 前5个: {y_pred_original[:5]}")
+    global_y_mean_original = y_scaler.mean_[0]
+    global_y_std_original = np.sqrt(y_scaler.var_[0]) if y_scaler.var_[0] > 1e-9 else 1.0
+    print(f"  全局训练集 y 均值 (原始尺度): {global_y_mean_original:.4f}")
+    if y_original.size > 0:
+        crop_y_mean_original = np.mean(y_original)
+        print(f"  '{test_set_name}' y 均值 (原始尺度): {crop_y_mean_original:.4f}")
+        crop_y_mean_scaled = (crop_y_mean_original - global_y_mean_original) / global_y_std_original if global_y_std_original > 1e-6 else float('nan')
+        print(f"  '{test_set_name}' y 均值 (转换到全局标准化尺度后): {crop_y_mean_scaled:.4f}")
+        if y_pred_scaled.size > 0:
+            mean_pred_scaled = np.mean(y_pred_scaled)
+            print(f"  '{test_set_name}' y_pred_scaled 均值: {mean_pred_scaled:.4f}")
+    print("--- 预测值诊断结束 ---")
 
 
-def optimize_rfr_for_crop(
-    trial: optuna.trial.Trial,
-    X_train_crop_scaled: np.ndarray,
-    y_train_crop_scaled: np.ndarray,
-    X_val_crop_scaled: np.ndarray,
-    y_val_crop_scaled: np.ndarray, # 验证集目标，已标准化
-    random_state: int,
-    n_jobs: int,
-) -> float:
-    """Optuna 目标函数，用于优化特定作物的 scikit-learn RandomForestRegressor。"""
-    n_estimators = trial.suggest_int("rf_n_estimators", 50, 300)
-    max_depth_choice = trial.suggest_categorical("rf_max_depth_choice", [None, 10, 20, 30, 50])
-    max_depth = None if max_depth_choice == "None" else int(max_depth_choice)
+def train_model(
+    model_name: str, model_instance: Any, x_train_scaled: np.ndarray, y_train_scaled: np.ndarray
+) -> Any:
+    # ... (与之前版本相同) ...
+    print(f"\n--- Training Model: {model_name} ---")
+    try:
+        print(f"   Fitting {model_name}...")
+        model_instance.fit(x_train_scaled, y_train_scaled.ravel())
+        print(f"   {model_name} trained successfully.")
+        return model_instance
+    except Exception as e:
+        print(f"Error during training of {model_name}: {e}"); traceback.print_exc(); return None
 
-    min_samples_split = trial.suggest_int("rf_min_samples_split", 2, 32)
-    min_samples_leaf = trial.suggest_int("rf_min_samples_leaf", 1, 32)
-    max_features = trial.suggest_categorical("rf_max_features", ["sqrt", "log2", 1.0]) # 1.0 for all features
-
-    model = RandomForestRegressor(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        min_samples_split=min_samples_split,
-        min_samples_leaf=min_samples_leaf,
-        max_features=max_features, # type: ignore
-        random_state=random_state,
-        n_jobs=n_jobs,
-    )
-    model.fit(X_train_crop_scaled, y_train_crop_scaled)
-    y_pred_val_scaled = model.predict(X_val_crop_scaled)
-    # Optuna 默认最小化目标，返回 RMSE
-    rmse = np.sqrt(np.mean((y_val_crop_scaled - y_pred_val_scaled) ** 2))
-    return rmse
-
-
-def main():
-    """主执行函数。"""
-    args = parse_args()
-
-    logger.info(f"--- Running Per-Crop Baseline Models ---")
-
-    # 1. 发现按作物划分的训练和测试数据集
-    train_crop_files = discover_crop_datasets(args.train_crop_data_dir, args.train_file_prefix)
-    test_crop_files = discover_crop_datasets(args.test_crop_data_dir, args.test_file_prefix)
-
-    if not train_crop_files:
-        logger.error(f"No training data files found in {args.train_crop_data_dir} with prefix {args.train_file_prefix}. Exiting.")
-        sys.exit(1)
-
-    # 设置 MLflow 主实验
-    mlflow.set_experiment(args.exp_name)
-    main_run_name = f"{args.run_name_prefix}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
-
-    with mlflow.start_run(run_name=main_run_name) as main_run: # 主运行
-        mlflow.log_params(vars(args))
-        logger.info(f"MLflow Main Run ID: {main_run.info.run_id} for experiment '{args.exp_name}'")
-
-        overall_metrics_all_crops_all_models: Dict[str, Dict[str, Dict[str, float]]] = {}
-
-        # 2. 遍历每个作物进行独立训练和测试
-        for crop_name, train_file_path in train_crop_files.items():
-            logger.info(f"\n\n=== Processing Crop: {crop_name} ===")
-            test_file_path = test_crop_files.get(crop_name)
-            if not test_file_path:
-                logger.warning(f"No test data file found for crop '{crop_name}' in {args.test_crop_data_dir} with prefix {args.test_file_prefix}. Skipping evaluation for this crop.")
-                continue
-
-            # 为当前作物创建一个 MLflow 父级运行
-            with mlflow.start_run(run_name=f"Crop_{crop_name}", nested=True) as crop_run:
-                mlflow.log_param("crop_name", crop_name)
-                logger.info(f"  MLflow Crop Run ID for '{crop_name}': {crop_run.info.run_id}")
-
-                # 2a. 加载当前作物的数据
-                logger.info(f"  Loading training data for '{crop_name}' from: {train_file_path}")
-                X_train_crop_3d_full, y_train_crop_full, info_train_crop_full = load_npz_data(
-                    train_file_path, data_split_type=f"train_{crop_name}"
-                )
-                validate_data(X_train_crop_3d_full, y_train_crop_full, info_train_crop_full, f"Train_full_{crop_name}")
-                info_train_crop_full = adapt_info_keys(info_train_crop_full, f"train_full_{crop_name}", logger)
-
-                # 移除 y 中的 NaN
-                nan_mask_train_crop = ~np.isnan(y_train_crop_full)
-                if not np.all(nan_mask_train_crop):
-                    logger.info(f"  Removing {np.sum(~nan_mask_train_crop)} NaN targets from '{crop_name}' training data.")
-                    X_train_crop_3d_full = X_train_crop_3d_full[nan_mask_train_crop]
-                    y_train_crop_full = y_train_crop_full[nan_mask_train_crop]
-
-                if X_train_crop_3d_full.shape[0] < 2 : # 需要至少2个样本进行划分或训练
-                    logger.warning(f"  Not enough training samples for crop '{crop_name}' after NaN removal ({X_train_crop_3d_full.shape[0]}). Skipping this crop.")
-                    continue
-                
-                # 为 Optuna HPO 划分内部验证集 (如果启用)
-                # 如果样本量非常小，可以考虑不划分，或使用交叉验证 (更复杂)
-                # 这里简化处理：如果样本太少，不进行 HPO 的内部验证划分
-                if args.enable_optuna_rfr and X_train_crop_3d_full.shape[0] > 10: # 示例阈值
-                    X_train_crop_3d_fit, X_val_crop_3d_internal, y_train_crop_fit, y_val_crop_internal = train_test_split(
-                        X_train_crop_3d_full, y_train_crop_full, test_size=0.2, random_state=args.random_state
-                    )
-                    info_train_crop_fit = info_train_crop_full.copy()
-                    info_val_crop_internal = info_train_crop_full.copy()
-                else: # 不进行 HPO 或样本太少，使用全部数据进行拟合
-                    X_train_crop_3d_fit = X_train_crop_3d_full
-                    y_train_crop_fit = y_train_crop_full
-                    info_train_crop_fit = info_train_crop_full
-                    X_val_crop_3d_internal, y_val_crop_internal, info_val_crop_internal = None, None, None
+def evaluate_on_test_set( 
+    fitted_model: Any, test_set_name: str, x_test_scaled: np.ndarray,
+    y_test_original: np.ndarray, y_scaler: StandardScaler
+) -> Dict:
+    # ... (与之前版本相同) ...
+    print(f"   Evaluating on test set: {test_set_name}...")
+    results = {"metrics": None, "y_pred_original": None, "y_pred_scaled": None, "error": None}
+    try:
+        y_pred_scaled_raw = fitted_model.predict(x_test_scaled) 
+        results["y_pred_scaled"] = y_pred_scaled_raw 
+        y_pred_original = y_scaler.inverse_transform(y_pred_scaled_raw.reshape(-1, 1)).ravel()
+        results["y_pred_original"] = y_pred_original
+        # print(f"    evaluate_on_test_set ({test_set_name}):") # 可减少打印
+        # print(f"      y_test_original shape: {y_test_original.shape}, first 5: {y_test_original[:5]}")
+        # print(f"      y_pred_original shape: {y_pred_original.shape}, first 5: {y_pred_original[:5]}")
+        metrics = evaluate.calculate_regression_metrics(y_test_original, y_pred_original)
+        results["metrics"] = metrics
+        print(f"   Metrics for {test_set_name}: {metrics}")
+    except Exception as e:
+        print(f"Error during evaluation on {test_set_name} for model {getattr(fitted_model, '__class__', type(fitted_model).__name__)}: {e}")
+        traceback.print_exc(); results["error"] = str(e)
+    return results
 
 
-                logger.info(f"  Loading test data for '{crop_name}' from: {test_file_path}")
-                X_test_crop_3d, y_test_crop, info_test_crop = load_npz_data(
-                    test_file_path, data_split_type=f"test_{crop_name}"
-                )
-                validate_data(X_test_crop_3d, y_test_crop, info_test_crop, f"Test_{crop_name}")
-                info_test_crop = adapt_info_keys(info_test_crop, f"test_{crop_name}", logger)
-                
-                nan_mask_test_crop = ~np.isnan(y_test_crop)
-                if not np.all(nan_mask_test_crop):
-                    logger.info(f"  Removing {np.sum(~nan_mask_test_crop)} NaN targets from '{crop_name}' test data.")
-                    X_test_crop_3d = X_test_crop_3d[nan_mask_test_crop]
-                    y_test_crop = y_test_crop[nan_mask_test_crop]
+def main(args):
+  print(f"--- 使用编码作物特征运行基线模型 ---")
+  mlflow.set_experiment(args.mlflow_experiment_name)
 
-                if X_test_crop_3d.shape[0] == 0:
-                    logger.warning(f"  Test data for crop '{crop_name}' is empty after NaN removal. Skipping evaluation for this crop.")
-                    continue
+  # print(f"\n1. 从 '{args.train_data_dir}' 加载并准备训练/验证数据...") # MODIFIED
+  # try:
+  #   # TODO: This part needs to be updated to handle per-crop loading based on new args.
+  #   # For now, it will likely fail if the path is a directory.
+  #   # This will be addressed in a subsequent subtask.
+  #   x_full_train_3d, y_full_train_original, original_train_info = load_data.load_npz_data(
+  #       args.train_data_dir) # MODIFIED
+    
+  #   print(f"  原始训练数据 info['num_static_features']: {original_train_info.get('num_static_features')}")
+  #   print(f"  原始训练数据 info['static_cols_used'] (最后5个): {original_train_info.get('static_cols_used', [])[-5:]}")
+  #   print(f"  原始训练数据 info['encoded_crop_label_col_name']: {original_train_info.get('encoded_crop_label_col_name')}")
+  #   # print(f"  原始训练数据 info['crop_label_mapping']: {original_train_info.get('crop_label_mapping')}")
+
+  #   train_info_for_featurizer = adapt_info_keys(original_train_info, "训练集")
+    
+  #   y_train_original_stats = {"mean": np.mean(y_full_train_original), "std": np.std(y_full_train_original),
+  #                             "min": np.min(y_full_train_original), "max": np.max(y_full_train_original)}
+  #   x_train_3d, x_val_3d, y_train_original, y_val_original = load_data.split_data(
+  #       x_full_train_3d, y_full_train_original,
+  #       test_size=args.val_split_size, random_state=args.random_seed)
+  # except Exception as e: print(f"加载或拆分训练数据时出错: {e}"); traceback.print_exc(); return
+
+  # print(f"\n2. 将训练集和验证集的3D特征转换为2D...")
+  # try:
+  #   x_train_2d = featurize_3d_to_2d(x_train_3d, train_info_for_featurizer, agg_funcs=AGGREGATION_FUNCTIONS)
+  #   x_val_2d = featurize_3d_to_2d(x_val_3d, train_info_for_featurizer, agg_funcs=AGGREGATION_FUNCTIONS)
+  #   print(f"   x_train_2d 形状: {x_train_2d.shape}") # 应该有 20*2 + 62 = 102 列
+  # except Exception as e: print(f"转换3D特征到2D时出错: {e}"); traceback.print_exc(); return
+
+  # print("\n3. 标准化特征和目标变量 (使用训练数据拟合)...")
+  # x_scaler = StandardScaler(); y_scaler = StandardScaler()
+  # try:
+  #   y_train_original_reshaped = y_train_original.reshape(-1, 1)
+  #   x_train_scaled = x_scaler.fit_transform(x_train_2d)
+  #   y_train_scaled = y_scaler.fit_transform(y_train_original_reshaped)
+  #   x_val_scaled = x_scaler.transform(x_val_2d)
+  #   print("   特征和目标标准化器已在训练数据上拟合。")
+  # except Exception as e: print(f"标准化数据时出错: {e}"); traceback.print_exc(); return
+
+  print("\n--- Initializing Data Discovery ---")
+  # Discover training files for each crop
+  # This script will now iterate over crops for training, so we need to find them first.
+  # The actual iteration logic will be in a subsequent subtask.
+  # For now, we just call the discovery function.
+  discovered_train_crop_files = discover_crop_train_files(args.train_data_dir, args.train_file_prefix)
+  if not discovered_train_crop_files:
+      print(f"错误: 在 {args.train_data_dir} 使用前缀 '{args.train_file_prefix}' 未找到任何训练作物文件。脚本将退出。")
+      return
+
+  # Discover test sets (per-crop)
+  # The per_crop_test_dir argument is currently unused here but might be used if
+  # test files are in a different structure than train files.
+  # For now, assuming test_data_dir and test_file_prefix are primary.
+  all_test_sets = discover_test_sets(args.test_data_dir, args.test_file_prefix)
+  if not all_test_sets:
+      print(f"警告: 在 {args.test_data_dir} 使用前缀 '{args.test_file_prefix}' 未找到任何测试作物文件。评估将受限。")
+      # Depending on requirements, might want to return if no test sets are found.
+  
+  test_set_map = {ts['name']: ts['path'] for ts in all_test_sets}
+  
+  baseline_models_config = [
+      {"name": "MeanPredictor", "instance": DummyRegressor(strategy="mean"), "params": {"strategy": "mean"}},
+      {"name": "LinearRegression", "instance": LinearRegression(), "params": {}},
+      {"name": "RandomForestRegressor_WithCropFeature", # 更新模型名以反映变化
+       "instance": RandomForestRegressor(n_estimators=RF_N_ESTIMATORS, max_depth=RF_MAX_DEPTH,
+                                       random_state=args.random_seed, n_jobs=-1),
+       "params": {"n_estimators": RF_N_ESTIMATORS, "max_depth": RF_MAX_DEPTH, "random_state": args.random_seed}}
+  ]
+  
+  overall_summary_results_all_crops = [] # To store summaries from all crops
+
+  print("\n--- Starting Per-Crop Training and Evaluation ---")
+  for crop_info in discovered_train_crop_files:
+      crop_name = crop_info['name']
+      crop_train_path = crop_info['path']
+      print(f"\n===== PROCESSING CROP: {crop_name} =====")
+      print(f"  Training data file: {crop_train_path}")
+
+      # 1. Load crop-specific training data
+      try:
+          x_full_train_3d_crop, y_full_train_original_crop, original_train_info_crop = \
+              load_data.load_npz_data(crop_train_path)
+          print(f"  Loaded training data for {crop_name}:")
+          print(f"    x_full_train_3d_crop shape: {x_full_train_3d_crop.shape}")
+          print(f"    y_full_train_original_crop shape: {y_full_train_original_crop.shape}")
+      except Exception as e:
+          print(f"  错误: 加载作物 '{crop_name}' 的训练数据 ({crop_train_path}) 时失败: {e}")
+          traceback.print_exc()
+          continue # Skip to the next crop
+
+      # 2. Match and load corresponding test data
+      crop_test_path = test_set_map.get(crop_name)
+      if not crop_test_path or not os.path.exists(crop_test_path):
+          print(f"  警告: 未找到作物 '{crop_name}' 的测试集文件，或路径 '{crop_test_path}' 不存在。跳过此作物。")
+          continue
+      
+      try:
+          x_test_3d_crop, y_test_original_crop, original_test_info_crop = \
+              load_data.load_npz_data(crop_test_path)
+          print(f"  Loaded test data for {crop_name}:")
+          print(f"    x_test_3d_crop shape: {x_test_3d_crop.shape}")
+          print(f"    y_test_original_crop shape: {y_test_original_crop.shape}")
+      except Exception as e:
+          print(f"  错误: 加载作物 '{crop_name}' 的测试数据 ({crop_test_path}) 时失败: {e}")
+          traceback.print_exc()
+          continue # Skip to the next crop
+
+      # 3. Adapt variable names (no validation split for now)
+      x_train_3d_crop = x_full_train_3d_crop
+      y_train_original_crop = y_full_train_original_crop
+      # original_train_info_crop and original_test_info_crop are loaded per crop.
+
+      try:
+          print(f"  Adapting info keys for {crop_name} train and test data...")
+          train_info_for_featurizer_crop = adapt_info_keys(original_train_info_crop, f"{crop_name} Train")
+          test_info_for_featurizer_crop = adapt_info_keys(original_test_info_crop, f"{crop_name} Test")
+
+          print(f"  Featurizing 3D data to 2D for {crop_name}...")
+          x_train_2d_crop = featurize_3d_to_2d(x_train_3d_crop, train_info_for_featurizer_crop, agg_funcs=AGGREGATION_FUNCTIONS)
+          x_test_2d_crop = featurize_3d_to_2d(x_test_3d_crop, test_info_for_featurizer_crop, agg_funcs=AGGREGATION_FUNCTIONS)
+          print(f"    x_train_2d_crop shape for {crop_name}: {x_train_2d_crop.shape}")
+          print(f"    x_test_2d_crop shape for {crop_name}: {x_test_2d_crop.shape}")
+
+          print(f"  Scaling features and target for {crop_name}...")
+          x_scaler_crop = StandardScaler()
+          y_scaler_crop = StandardScaler()
+
+          y_train_original_reshaped_crop = y_train_original_crop.reshape(-1, 1)
+          x_train_scaled_crop = x_scaler_crop.fit_transform(x_train_2d_crop)
+          y_train_scaled_crop = y_scaler_crop.fit_transform(y_train_original_reshaped_crop)
+          
+          x_test_scaled_crop = x_scaler_crop.transform(x_test_2d_crop)
+          print(f"    Per-crop scaling completed for {crop_name}.")
+
+      except Exception as e:
+          print(f"  错误: 在处理作物 '{crop_name}' 的特征工程或缩放时失败: {e}")
+          traceback.print_exc()
+          continue # Skip to the next crop
+
+      # TODO (in subsequent steps):
+      # - Per-crop MLflow logging
+      # - Aggregate results for this crop and append to overall_summary_results_all_crops
+      
+      for model_config in baseline_models_config:
+          model_name = model_config["name"]
+          model_instance_template = model_config["instance"] # This is a new instance for each crop and model
+          model_params_to_log = model_config["params"]
+
+          print(f"\n  --- Processing Model: {model_name} for Crop: {crop_name} ---")
+          
+          fitted_model_crop = train_model(
+              model_name=f"{model_name}_{crop_name}", # Model name includes crop
+              model_instance=model_instance_template, 
+              x_train_scaled=x_train_scaled_crop, 
+              y_train_scaled=y_train_scaled_crop
+          )
+
+          current_model_summary = {
+              "crop_name": crop_name,
+              "model_name": model_name,
+              "metrics": None, # Default if training fails or evaluation error
+              "error": None
+          }
+
+          if not fitted_model_crop:
+              print(f"  错误: 模型 '{model_name}' 在作物 '{crop_name}' 上训练失败。")
+              current_model_summary["error"] = "Training failed"
+              overall_summary_results_all_crops.append(current_model_summary)
+              continue # To the next model in baseline_models_config
+
+          # Feature Importance (for RandomForest)
+          if "RandomForest" in model_name and hasattr(fitted_model_crop, 'feature_importances_'):
+              print(f"\n  --- {model_name}_{crop_name} 特征重要性分析 ---")
+              importances = fitted_model_crop.feature_importances_
+              
+              feature_names_2d = []
+              # Use train_info_for_featurizer_crop for feature names
+              temp_cols_orig = train_info_for_featurizer_crop.get('original_temporal_cols_used', [])
+              for temp_col_name in temp_cols_orig:
+                  for agg_func_name in AGGREGATION_FUNCTIONS: # AGGREGATION_FUNCTIONS is global
+                      feature_names_2d.append(f"{temp_col_name}_{agg_func_name}")
+              
+              stat_cols_orig = train_info_for_featurizer_crop.get('original_static_cols_used', []) 
+              feature_names_2d.extend(stat_cols_orig)
+
+              if len(importances) == len(feature_names_2d):
+                  feature_importance_df = pd.DataFrame({'feature': feature_names_2d, 'importance': importances})
+                  feature_importance_df = feature_importance_df.sort_values('importance', ascending=False)
+                  print("    最重要的前15个特征:")
+                  print(feature_importance_df.head(15))
+                  
+                  encoded_crop_col_name_from_info = train_info_for_featurizer_crop.get('encoded_crop_label_col_name')
+                  print(f"    从info中获取的编码作物列名: {encoded_crop_col_name_from_info}")
+                  
+                  if encoded_crop_col_name_from_info and encoded_crop_col_name_from_info in feature_names_2d:
+                      try:
+                          crop_feat_importance_val = feature_importance_df.loc[feature_importance_df['feature'] == encoded_crop_col_name_from_info, 'importance'].iloc[0]
+                          print(f"    特征 '{encoded_crop_col_name_from_info}' 的重要性: {crop_feat_importance_val:.4f}")
+                          rank_series = feature_importance_df['feature'].reset_index(drop=True)
+                          rank = rank_series[rank_series == encoded_crop_col_name_from_info].index[0] + 1
+                          print(f"    特征 '{encoded_crop_col_name_from_info}' 的重要性排名: {rank} / {len(feature_names_2d)}")
+                      except IndexError:
+                          print(f"    警告: 无法获取特征 '{encoded_crop_col_name_from_info}' 的重要性或排名。")
+                  else:
+                      print(f"    警告: 编码后的作物特征列 '{encoded_crop_col_name_from_info}' 未在2D特征名称列表或原始静态列中找到。")
+              else:
+                  print(f"    警告: 特征重要性数量 ({len(importances)}) 与2D特征名称数量 ({len(feature_names_2d)}) 不匹配。")
+              print(f"  --- 特征重要性分析结束 for {model_name}_{crop_name} ---")
+
+          # Per-Crop Evaluation
+          print(f"  Evaluating {model_name}_{crop_name} on test data for {crop_name}...")
+          eval_results_specific_crop = evaluate_on_test_set(
+              fitted_model=fitted_model_crop, 
+              test_set_name=crop_name, # test_set_name is now the crop_name
+              x_test_scaled=x_test_scaled_crop, 
+              y_test_original=y_test_original_crop, 
+              y_scaler=y_scaler_crop # Use the crop-specific y_scaler
+          )
+          
+          current_model_summary["metrics"] = eval_results_specific_crop.get("metrics")
+          current_model_summary["error"] = eval_results_specific_crop.get("error")
 
 
-                # 2b. 3D 特征转换为 2D (针对当前作物)
-                logger.info(f"  Converting 3D features to 2D for '{crop_name}'...")
-                featurizer_crop = BaselineFeaturizer(
-                    temporal_agg_methods=args.temporal_agg_methods,
-                    static_feature_usage_strategy=args.static_feature_usage_strategy,
-                    scaler_type="None", # 先不缩放
-                    static_row_index=args.static_row_index_for_featurizer,
-                    add_dummy_crop_feature=False, # 数据已按作物划分
-                )
-                X_train_crop_2d_unscaled = featurizer_crop.fit_transform(X_train_crop_3d_fit, info_train_crop_fit)
-                feature_names_2d_crop = featurizer_crop.get_feature_names_out()
-                
-                if X_val_crop_3d_internal is not None:
-                    X_val_crop_2d_internal_unscaled = featurizer_crop.transform(X_val_crop_3d_internal, info_val_crop_internal)
-                else:
-                    X_val_crop_2d_internal_unscaled = None
+          if crop_name in CROPS_FOR_DETAILED_DEBUG and eval_results_specific_crop.get("y_pred_scaled") is not None:
+              print_prediction_diagnostics(
+                  y_test_original_crop, 
+                  eval_results_specific_crop["y_pred_scaled"],
+                  eval_results_specific_crop["y_pred_original"], 
+                  y_scaler_crop, # Use crop-specific y_scaler
+                  crop_name
+              )
+          
+          
+          with mlflow.start_run(run_name=f"{model_name}_{crop_name}"):
+              print(f"    Logging to MLflow for run: {model_name}_{crop_name}")
+              mlflow.log_param("crop_name", crop_name)
+              mlflow.log_param("model_name", model_name) # Log base model name
+              mlflow.log_params(args.__dict__) # Log general script args
+              mlflow.log_param("aggregation_functions", str(AGGREGATION_FUNCTIONS))
+              for param_name, param_value in model_params_to_log.items(): # Log specific model params
+                  mlflow.log_param(param_name, param_value)
 
-                X_test_crop_2d_unscaled = featurizer_crop.transform(X_test_crop_3d, info_test_crop)
-                logger.info(f"    x_train_crop_2d_unscaled shape: {X_train_crop_2d_unscaled.shape}")
+              mlflow.sklearn.log_model(fitted_model_crop, artifact_path="model")
 
-                # 2c. 标准化特征和目标变量 (针对当前作物)
-                logger.info(f"  Standardizing 2D features and target variables for '{crop_name}'...")
-                feature_scaler_crop: Optional[StandardScaler] = None
-                if args.scaler_type != "None":
-                    if args.scaler_type == "StandardScaler":
-                        feature_scaler_crop = StandardScaler()
-                    elif args.scaler_type == "MinMaxScaler":
-                        from sklearn.preprocessing import MinMaxScaler
-                        feature_scaler_crop = MinMaxScaler() # type: ignore
-                    
-                    if feature_scaler_crop is not None:
-                        X_train_crop_2d_scaled = feature_scaler_crop.fit_transform(X_train_crop_2d_unscaled)
-                        if X_val_crop_2d_internal_unscaled is not None:
-                             X_val_crop_2d_internal_scaled = feature_scaler_crop.transform(X_val_crop_2d_internal_unscaled)
-                        else:
-                            X_val_crop_2d_internal_scaled = None
-                        X_test_crop_2d_scaled = feature_scaler_crop.transform(X_test_crop_2d_unscaled)
-                else:
-                    X_train_crop_2d_scaled = X_train_crop_2d_unscaled
-                    X_val_crop_2d_internal_scaled = X_val_crop_2d_internal_unscaled
-                    X_test_crop_2d_scaled = X_test_crop_2d_unscaled
+              # Scalers
+              scaler_crop_dir = os.path.join("scalers", crop_name)
+              os.makedirs(scaler_crop_dir, exist_ok=True)
+              x_scaler_path_crop = os.path.join(scaler_crop_dir, f"{model_name}_{crop_name}_x_scaler.joblib")
+              y_scaler_path_crop = os.path.join(scaler_crop_dir, f"{model_name}_{crop_name}_y_scaler.joblib")
+              joblib.dump(x_scaler_crop, x_scaler_path_crop)
+              joblib.dump(y_scaler_crop, y_scaler_path_crop)
+              mlflow.log_artifact(x_scaler_path_crop, artifact_path=f"scalers/{crop_name}")
+              mlflow.log_artifact(y_scaler_path_crop, artifact_path=f"scalers/{crop_name}")
 
-                target_scaler_crop = StandardScaler()
-                y_train_crop_scaled = target_scaler_crop.fit_transform(y_train_crop_fit.reshape(-1, 1)).ravel()
-                if y_val_crop_internal is not None:
-                    y_val_crop_internal_scaled = target_scaler_crop.transform(y_val_crop_internal.reshape(-1,1)).ravel()
-                else:
-                    y_val_crop_internal_scaled = None
+              # Metrics
+              if eval_results_specific_crop.get("metrics"):
+                  for k, v in eval_results_specific_crop["metrics"].items():
+                      mlflow.log_metric(k, v) # Logs R2, MAE etc. directly
+              
+              if eval_results_specific_crop.get("error"):
+                   mlflow.log_param(f"{crop_name}_{model_name}_evaluation_error", eval_results_specific_crop.get("error"))
 
 
-                crop_model_metrics_summary: Dict[str, Dict[str, float]] = {}
-                # 2d. 训练和评估模型 (针对当前作物)
-                for model_name in args.model_names:
-                    with mlflow.start_run(run_name=f"Model_{model_name}_For_{crop_name}", nested=True) as model_run:
-                        mlflow.log_param("model_name_for_crop", model_name)
-                        mlflow.log_param("crop_name_for_model", crop_name)
-                        logger.info(f"\n    --- Training Model: {model_name} for Crop: {crop_name} ---")
-                        logger.info(f"      MLflow Model Run ID for {model_name} on '{crop_name}': {model_run.info.run_id}")
+              # Predictions CSV
+              if eval_results_specific_crop.get("y_pred_original") is not None:
+                  predictions_crop_dir = os.path.join("predictions", crop_name)
+                  os.makedirs(predictions_crop_dir, exist_ok=True)
+                  predictions_csv_path_crop = os.path.join(predictions_crop_dir, f"{model_name}_{crop_name}_test_predictions.csv")
+                  
+                  predictions_df = pd.DataFrame({
+                      'y_true': y_test_original_crop.ravel(),
+                      'y_pred': eval_results_specific_crop["y_pred_original"].ravel()
+                  })
+                  predictions_df.to_csv(predictions_csv_path_crop, index=False)
+                  mlflow.log_artifact(predictions_csv_path_crop, artifact_path=f"predictions/{crop_name}")
 
-                        model_crop: Any = None
-                        if model_name == "MeanPredictor":
-                            model_crop = MeanPredictor()
-                        elif model_name == "LinearRegression":
-                            model_crop = LinearRegression(n_jobs=args.n_jobs)
-                        elif model_name == "RandomForestRegressor_WithCropFeature":
-                            if args.enable_optuna_rfr and OPTUNA_AVAILABLE and \
-                               X_val_crop_2d_internal_scaled is not None and y_val_crop_internal_scaled is not None:
-                                logger.info(f"      Optimizing RandomForest for '{crop_name}' with Optuna...")
-                                study_crop = optuna.create_study(direction="minimize")
-                                study_crop.optimize(
-                                    lambda trial: optimize_rfr_for_crop(
-                                        trial,
-                                        X_train_crop_2d_scaled,
-                                        y_train_crop_scaled,
-                                        X_val_crop_2d_internal_scaled, # type: ignore
-                                        y_val_crop_internal_scaled,    # type: ignore
-                                        args.random_state,
-                                        args.n_jobs,
-                                    ),
-                                    n_trials=args.n_trials_rfr_optuna,
-                                )
-                                best_params_rfr_crop = study_crop.best_params
-                                logger.info(f"      Best Optuna HPO params for RFR on '{crop_name}': {best_params_rfr_crop}")
-                                mlflow.log_params({f"optuna_best_{k}": v for k,v in best_params_rfr_crop.items()})
-                                model_crop = RandomForestRegressor(
-                                    n_estimators=best_params_rfr_crop.get("rf_n_estimators", args.rf_n_estimators),
-                                    max_depth=best_params_rfr_crop.get("rf_max_depth_choice", args.rf_max_depth), # Adapt key
-                                    min_samples_split=best_params_rfr_crop.get("rf_min_samples_split", args.rf_min_samples_split),
-                                    min_samples_leaf=best_params_rfr_crop.get("rf_min_samples_leaf", args.rf_min_samples_leaf),
-                                    max_features=best_params_rfr_crop.get("rf_max_features", "sqrt"), # Adapt key
-                                    random_state=args.random_state,
-                                    n_jobs=args.n_jobs,
-                                )
-                            else:
-                                model_crop = RandomForestRegressor(
-                                    n_estimators=args.rf_n_estimators,
-                                    max_depth=args.rf_max_depth,
-                                    min_samples_split=args.rf_min_samples_split,
-                                    min_samples_leaf=args.rf_min_samples_leaf,
-                                    random_state=args.random_state,
-                                    n_jobs=args.n_jobs,
-                                )
-                        else:
-                            logger.warning(f"      Model {model_name} not recognized. Skipping for crop {crop_name}.")
-                            continue
+              mlflow.set_tag("status", "COMPLETED_PER_CROP")
+          
+          overall_summary_results_all_crops.append(current_model_summary)
 
-                        logger.info(f"      Fitting {model_name} for '{crop_name}'...")
-                        model_crop.fit(X_train_crop_2d_scaled, y_train_crop_scaled)
-                        logger.info(f"      {model_name} for '{crop_name}' trained successfully.")
-                        try:
-                            mlflow.sklearn.log_model(model_crop, f"{model_name}_{crop_name}_model")
-                        except Exception as e:
-                             logger.warning(f"MLflow: Model logged without a signature for {model_name} on {crop_name}: {e}")
+  # The existing code block for model training and evaluation has been moved into the loop above.
+  # overall_summary_results = [] # This is now overall_summary_results_all_crops
+
+  # print("\n5. 训练基线模型并在所有测试集上评估... (EXISTING CODE BLOCK - TO BE REFACTORED/REMOVED)")
+  # This loop will be moved inside the per-crop loop and adapted.
+  # for model_config in baseline_models_config:
+  #   model_name = model_config["name"]
+  #   model_instance_template = model_config["instance"]
+    # model_params_to_log = model_config["params"]
+
+    # fitted_model = train_model(
+    #     model_name=model_name, model_instance=model_instance_template,
+    #     x_train_scaled=x_train_scaled, y_train_scaled=y_train_scaled # These need to be crop-specific
+    # )
+    # if not fitted_model:
+    #     overall_summary_results.append({"model_name": model_name, "error": "Training failed"}) # This should be overall_summary_results_all_crops
+    #     continue
+
+    # # 特征重要性分析 (RandomForest)
+    # if "RandomForest" in model_name and hasattr(fitted_model, 'feature_importances_'):
+    #     print(f"\n--- {model_name} 特征重要性分析 ---")
+    #     importances = fitted_model.feature_importances_
+        
+    #     # This feature_names_2d needs to be derived from crop-specific train_info_for_featurizer
+    #     feature_names_2d = [] 
+    #     temp_cols_orig = train_info_for_featurizer.get('original_temporal_cols_used', [])
+    #     for temp_col_name in temp_cols_orig:
+    #         for agg_func_name in AGGREGATION_FUNCTIONS:
+    #             feature_names_2d.append(f"{temp_col_name}_{agg_func_name}")
+        
+    #     stat_cols_orig = train_info_for_featurizer.get('original_static_cols_used', []) 
+    #     feature_names_2d.extend(stat_cols_orig)
+
+    #     if len(importances) == len(feature_names_2d):
+    #         feature_importance_df = pd.DataFrame({'feature': feature_names_2d, 'importance': importances})
+    #         feature_importance_df = feature_importance_df.sort_values('importance', ascending=False)
+    #         print("  最重要的前15个特征:") 
+    #         print(feature_importance_df.head(15))
+            
+    #         encoded_crop_col_name_from_info = train_info_for_featurizer.get('encoded_crop_label_col_name')
+    #         print(f"  从info中获取的编码作物列名: {encoded_crop_col_name_from_info}")
+    #         print(f"  检查 '{encoded_crop_col_name_from_info}' 是否在 stat_cols_orig ({len(stat_cols_orig)}个)中: {encoded_crop_col_name_from_info in stat_cols_orig}")
+    #         print(f"  stat_cols_orig (最后5个): {stat_cols_orig[-5:]}")
+
+    #         if encoded_crop_col_name_from_info and encoded_crop_col_name_from_info in feature_names_2d:
+    #             try:
+    #                 crop_feat_importance = feature_importance_df.loc[feature_importance_df['feature'] == encoded_crop_col_name_from_info, 'importance'].iloc[0]
+    #                 print(f"  特征 '{encoded_crop_col_name_from_info}' 的重要性: {crop_feat_importance:.4f}")
+    #                 rank_series = feature_importance_df['feature'].reset_index(drop=True)
+    #                 rank = rank_series[rank_series == encoded_crop_col_name_from_info].index[0] + 1
+    #                 print(f"  特征 '{encoded_crop_col_name_from_info}' 的重要性排名: {rank} / {len(feature_names_2d)}")
+    #             except IndexError: 
+    #                 print(f"  警告: 无法获取特征 '{encoded_crop_col_name_from_info}' 的重要性或排名。")
+    #         else:
+    #             print(f"  警告: 编码后的作物特征列 '{encoded_crop_col_name_from_info}' 未在2D特征名称列表或原始静态列中找到。")
+    #     else:
+    #         print(f"  警告: 特征重要性数量 ({len(importances)}) 与2D特征名称数量 ({len(feature_names_2d)}) 不匹配。")
+    #     print("--- 特征重要性分析结束 ---")
+
+    # with mlflow.start_run(run_name=f"{model_name}_{crop_name}"): # Crop-specific run name
+    #   mlflow.log_param("crop_name", crop_name)
+    #   mlflow.log_param("model_name", model_name); mlflow.log_params(args.__dict__); mlflow.log_param("aggregation_functions", str(AGGREGATION_FUNCTIONS))
+    #   for param_name, param_value in model_params_to_log.items(): mlflow.log_param(param_name, param_value)
+    #   mlflow.sklearn.log_model(fitted_model, "model")
+      
+    #   scaler_path_dir = f"scalers_{crop_name}"; os.makedirs(scaler_path_dir, exist_ok=True)
+    #   # x_scaler and y_scaler need to be crop-specific
+    #   x_scaler_path = os.path.join(scaler_path_dir, f"{model_name}_x_scaler.joblib"); joblib.dump(x_scaler, x_scaler_path)
+    #   y_scaler_path = os.path.join(scaler_path_dir, f"{model_name}_y_scaler.joblib"); joblib.dump(y_scaler, y_scaler_path)
+    #   mlflow.log_artifact(x_scaler_path, f"scalers/{crop_name}"); mlflow.log_artifact(y_scaler_path, f"scalers/{crop_name}")
+
+    #   # Validation set evaluation needs to use crop-specific val data (if we re-introduce val split)
+    #   # val_eval_results = evaluate_on_test_set(
+    #   #     fitted_model, "ValidationSet", x_val_scaled_crop, y_val_original_crop, y_scaler_crop)
+    #   # if val_eval_results.get("metrics"):
+    #   #     for k, v in val_eval_results["metrics"].items(): mlflow.log_metric(f"ValidationSet_{k}", v)
+      
+    #   model_summary_entry = {"model_name": model_name, "crop_name": crop_name, "test_metrics": {}} # "validation_metrics": val_eval_results.get("metrics"),
+
+    #   # Test set evaluation should use the matched crop-specific test set
+    #   # For now, this iterates all test_sets_to_evaluate, which is not right for single crop training.
+    #   # It should use the specific x_test_scaled_crop, y_test_original_crop for the current crop_name
+    #   # if test_set_info["name"] == crop_name: ... (logic to use the matched test set)
+    #   for test_set_info in test_sets_to_evaluate: # This needs to be restricted to current crop's test set
+    #     if test_set_info["name"] == crop_name: # Only evaluate on the matched test set
+    #         test_set_name = test_set_info["name"] # Should be crop_name
+    #         # test_file_path = test_set_info["path"] # Already loaded as crop_test_path
+    #         print(f"\n     校验并评估测试集: {test_set_name} for crop {crop_name}")
+    #         try:
+    #             # Data already loaded as x_test_3d_crop, y_test_original_crop, original_test_info_crop
+    #             # Featurization and scaling needs to happen here for test_data_crop
+    #             # test_info_for_featurizer_specific = adapt_info_keys(original_test_info_crop, test_set_name)
+    #             # x_test_2d_specific = featurize_3d_to_2d(
+    #             #     x_test_3d_crop, test_info_for_featurizer_specific, agg_funcs=AGGREGATION_FUNCTIONS
+    #             # )
+    #             # x_test_scaled_specific = x_scaler.transform(x_test_2d_specific) # Use crop-specific x_scaler
+
+    #             # eval_results_specific = evaluate_on_test_set(
+    #             #     fitted_model, test_set_name, x_test_scaled_specific, # This should be x_test_2d_crop_scaled
+    #             #     y_test_original_crop, y_scaler # Use crop-specific y_scaler
+    #             # )
+    #             # model_summary_entry["test_metrics"] = eval_results_specific.get("metrics")
+    #             pass # Placeholder for actual evaluation
+    #         except Exception as e_test_set:
+    #             print(f"  处理测试集 {test_set_name} 时出错: {e_test_set}"); traceback.print_exc()
+    #             model_summary_entry["test_metrics"] = {"error": str(e_test_set)}
+    #             if mlflow.active_run(): mlflow.log_param(f"{test_set_name}_error", str(e_test_set))
+    #   overall_summary_results_all_crops.append(model_summary_entry) # Correct list
+  
+  
+  print("\n--- Overall Summary of Results ---")
+  if not overall_summary_results_all_crops:
+      print("  No results to summarize.")
+  else:
+      for result_entry in overall_summary_results_all_crops:
+          print(f"Crop: {result_entry.get('crop_name')}, Model: {result_entry.get('model_name')}")
+          if result_entry.get("metrics"):
+              print(f"  Metrics: {result_entry.get('metrics')}")
+          if result_entry.get("error"): # Check if error key exists and has a value
+              print(f"  Error: {result_entry.get('error')}")
+          print("---")
+
+  print("\n--- Baseline model evaluation (per-crop with encoded crop feature) completed ---")
 
 
-                        logger.info(f"      Evaluating {model_name} on test set for '{crop_name}'...")
-                        y_pred_crop_scaled = model_crop.predict(X_test_crop_2d_scaled)
-                        y_pred_crop_original = target_scaler_crop.inverse_transform(
-                            y_pred_crop_scaled.reshape(-1, 1)
-                        ).ravel()
-
-                        metrics_crop = calculate_regression_metrics(y_test_crop, y_pred_crop_original)
-                        logger.info(f"      Metrics for {model_name} on '{crop_name}' test set: {metrics_crop}")
-                        log_metrics_to_mlflow(metrics_crop, prefix=f"test_{crop_name}_") # Log with crop prefix
-                        crop_model_metrics_summary[model_name] = metrics_crop
-
-                        # Prediction diagnostics for specific crops
-                        if crop_name in CROP_NAMES_FOR_DIAGNOSTICS:
-                            logger.info(f"      --- '{crop_name}' Prediction Diagnostics for {model_name} ---")
-                            logger.info(f"         y_original (test) shape: {y_test_crop.shape}, first 5: {y_test_crop[:5]}")
-                            logger.info(f"         y_pred_scaled (model direct output) shape: {y_pred_crop_scaled.shape}, first 5: {y_pred_crop_scaled[:5]}")
-                            logger.info(f"         y_pred_original (inverse-standardized) shape: {y_pred_crop_original.shape}, first 5: {y_pred_crop_original[:5]}")
-                            logger.info(f"         Crop-specific training y mean (original scale): {target_scaler_crop.mean_[0]:.4f}")
-                            logger.info(f"         '{crop_name}' test y mean (original scale): {np.mean(y_test_crop):.4f}")
-                            if target_scaler_crop.scale_[0] > 1e-6:
-                                y_test_mean_crop_scaled = (np.mean(y_test_crop) - target_scaler_crop.mean_[0]) / target_scaler_crop.scale_[0]
-                                logger.info(f"         '{crop_name}' test y mean (to crop-specific standardized scale): {y_test_mean_crop_scaled:.4f}")
-                                y_pred_crop_scaled_mean = np.mean(y_pred_crop_scaled)
-                                logger.info(f"         '{crop_name}' y_pred_scaled mean: {y_pred_crop_scaled_mean:.4f}")
-                            else:
-                                logger.info(f"         '{crop_name}' test y mean (to crop-specific standardized scale): Cannot compute, crop target_scaler.scale_ is too small.")
-                            logger.info(f"      --- Prediction Diagnostics End for '{crop_name}', Model {model_name} ---")
-                        
-                        # Feature importance for RandomForest on this crop
-                        if model_name == "RandomForestRegressor_WithCropFeature" and hasattr(model_crop, "feature_importances_"):
-                            logger.info(f"    --- {model_name} Feature Importance for Crop: {crop_name} ---")
-                            importances_crop = model_crop.feature_importances_
-                            feature_importance_df_crop = pd.DataFrame(
-                                {"feature": feature_names_2d_crop, "importance": importances_crop}
-                            ).sort_values("importance", ascending=False)
-                            logger.info(f"      Top 15 features for '{crop_name}':\n{feature_importance_df_crop.head(15)}")
-                            mlflow.log_dict(feature_importance_df_crop.to_dict(), f"feature_importances_{crop_name}.json")
-                            logger.info(f"    --- Feature Importance Analysis End for '{crop_name}' ---")
-
-                overall_metrics_all_crops_all_models[crop_name] = crop_model_metrics_summary
-                logger.info(f"=== Finished processing Crop: {crop_name} ===")
-
-
-        logger.info("\n\n--- Per-Crop Baseline Models Overall Evaluation Summary ---")
-        for crop_name_summary, models_data in overall_metrics_all_crops_all_models.items():
-            logger.info(f"Crop: {crop_name_summary}")
-            for model_name_summary, metrics_values in models_data.items():
-                logger.info(f"  Model: {model_name_summary}, Metrics: {metrics_values}")
-            logger.info("----------------------------------------")
-        logger.info(f"--- All per-crop baseline model runs finished. Main Run ID: {main_run.info.run_id} ---")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser(
+      description="Run baseline models with encoded crop feature and per-crop evaluation."
+  )
+  parser.add_argument("--train_data_dir", type=str, default=DEFAULT_TRAIN_DATA_DIR,
+                        help="Directory containing per-crop training NPZ files.")
+  parser.add_argument("--test_data_dir", type=str, default=DEFAULT_TEST_DATA_DIR,
+                        help="Directory containing per-crop test NPZ files.")
+  parser.add_argument("--train_file_prefix", type=str, default='train_processed_',
+                        help="Prefix for per-crop training NPZ files (e.g., 'train_processed_').")
+  parser.add_argument("--test_file_prefix", type=str, default='test_processed_',
+                        help="Prefix for per-crop test NPZ files (e.g., 'test_processed_').")
+  parser.add_argument("--per_crop_test_dir", type=str, default=None)
+  parser.add_argument("--val_split_size", type=float, default=VAL_SPLIT_SIZE)
+  parser.add_argument("--random_seed", type=int, default=RANDOM_SEED)
+  parser.add_argument("--mlflow_experiment_name", type=str, default=DEFAULT_MLFLOW_EXPERIMENT_NAME)
+  
+  args = parser.parse_args()
+  main(args)
